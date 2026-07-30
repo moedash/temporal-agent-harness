@@ -60,6 +60,7 @@ if typing.TYPE_CHECKING:
 def _set_open_ai_agent_temporal_overrides(
     model_params: ModelActivityParameters,
     start_spans_in_replay: bool = False,
+    use_nexus_mcp_transport: bool = False,
 ):
     previous_runner = get_default_agent_runner()
     previous_trace_provider = get_trace_provider()
@@ -68,7 +69,9 @@ def _set_open_ai_agent_temporal_overrides(
     )
 
     try:
-        set_default_agent_runner(TemporalOpenAIRunner(model_params))
+        set_default_agent_runner(
+            TemporalOpenAIRunner(model_params, use_nexus_mcp_transport)
+        )
         set_trace_provider(provider)
         yield provider
     finally:
@@ -222,6 +225,7 @@ class OpenAIAgentsPlugin(SimplePlugin):
         add_temporal_spans: bool = True,
         use_otel_instrumentation: bool = False,
         observer_factory: ObserverFactory | None = None,
+        use_nexus_mcp_transport: bool = False,
     ) -> None:
         """Initialize the OpenAI agents plugin.
 
@@ -256,6 +260,12 @@ class OpenAIAgentsPlugin(SimplePlugin):
                 stream). If ``None``, streaming publishes raw events to
                 ``model_params.streaming_topic`` as before.
                 Warning: streaming support is experimental and behavior may change in future versions.
+            use_nexus_mcp_transport: If true, the agent gets a Nexus-transport MCP server. This allows us to:
+                - register Nexus-backed MCP tools and have Nexus-transport back the entire MCP lifecycle
+                - use the nexus/mcp/durable_tools_gateway which allows us to register third-party MCP
+                  servers against the durable_tools_gateway, and have the Nexus-transport back the interactions
+                  between the harness and the gateway.
+                For workers that don't need the Nexus-transport MCP integration, nothing changes for them.
 
         """
         if model_params is None:
@@ -355,6 +365,7 @@ class OpenAIAgentsPlugin(SimplePlugin):
                 with _set_open_ai_agent_temporal_overrides(
                     model_params,
                     start_spans_in_replay=use_otel_instrumentation,
+                    use_nexus_mcp_transport=use_nexus_mcp_transport,
                 ):
                     yield
 

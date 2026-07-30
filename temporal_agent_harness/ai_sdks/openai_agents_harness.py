@@ -295,13 +295,15 @@ def stream_to_provider(model: str | None, run_context: Any) -> _HarnessStreamTok
     Reads the in-flight turn's stream context off that runner and bundles it with the
     model. Returns ``None`` when the run context is not a harness runner or there is no
     active turn, so the vendored stub falls back to ``streaming_topic``.
+
+    Duck-types ``run_context`` instead of ``isinstance(..., AgentWorkflowRunner)`` --
+    sandboxed workflows can reload that class, making ``isinstance`` silently False across
+    module reloads. Dumping to a plain dict sidesteps the same issue for pydantic.
     """
-    if not isinstance(run_context, AgentWorkflowRunner):
-        return None
-    context = run_context.current_stream_context
+    context = getattr(run_context, "current_stream_context", None)
     if context is None:
         return None
-    return _HarnessStreamToken(context=context, model=model)
+    return _HarnessStreamToken(context=context.model_dump(), model=model)
 
 
 def harness_observer_factory(token: Any) -> StreamObserver[Any]:

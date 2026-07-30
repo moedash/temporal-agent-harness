@@ -1,6 +1,6 @@
 import dataclasses
 from collections.abc import AsyncIterator, Awaitable
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from agents import (
     Agent,
@@ -15,6 +15,7 @@ from agents import (
     TContext,
     TResponseInputItem,
 )
+from agents.mcp import MCPServer
 from agents.run import DEFAULT_AGENT_RUNNER, AgentRunner, RunOptions
 from agents.sandbox import SandboxAgent
 from typing_extensions import Unpack
@@ -27,6 +28,13 @@ from temporal_agent_harness.ai_sdks.openai_agents.sandbox._temporal_sandbox_clie
 )
 from temporal_agent_harness.ai_sdks.openai_agents.workflow import AgentsWorkflowError
 
+# Helper to create a Nexus-backed MCP transport that we can use to inject to the agent converter.
+def _create_nexus_transport_mcp_server() -> MCPServer:
+    from temporal_agent_harness.ai_sdks.openai_agents.workflow import (
+        nexus_transport_mcp_server,
+    )
+    return cast(MCPServer, nexus_transport_mcp_server(name="nexus-transport"))
+
 
 # Recursively replace models in all agents
 def _convert_agent(
@@ -34,6 +42,7 @@ def _convert_agent(
     agent: Agent[Any],
     seen: dict[int, Agent] | None,
     run_context: Any = None,
+    nexus_transport_mcp_server: MCPServer | None = None,
 ) -> Agent[Any]:
     if seen is None:
         seen = dict()
@@ -55,7 +64,11 @@ def _convert_agent(
     new_handoffs: list[Agent | Handoff] = []
     for handoff in agent.handoffs:
         if isinstance(handoff, Agent):
-            new_handoffs.append(_convert_agent(model_params, handoff, seen, run_context))
+            new_handoffs.append(
+                _convert_agent(
+                    model_params, handoff, seen, run_context, nexus_transport_mcp_server
+                )
+            )
         elif isinstance(handoff, Handoff):
             original_invoke = handoff.on_invoke_handoff
 
@@ -69,7 +82,13 @@ def _convert_agent(
                 run_context: Any = run_context,
             ) -> Agent:
                 handoff_agent = await invoke_func(context, args)
-                return _convert_agent(model_params, handoff_agent, seen, run_context)
+                return _convert_agent(
+                    model_params,
+                    handoff_agent,
+                    seen,
+                    run_context,
+                    nexus_transport_mcp_server,
+                )
 
             new_handoffs.append(
                 dataclasses.replace(handoff, on_invoke_handoff=on_invoke)
@@ -84,6 +103,17 @@ def _convert_agent(
         run_context=run_context,
     )
     new_agent.handoffs = new_handoffs
+
+    if nexus_transport_mcp_server is not None:
+        from temporal_agent_harness.ai_sdks.openai_agents._nexus_mcp import (
+            _NexusTransportMCPServer,
+        )
+
+        if not any(
+            isinstance(s, _NexusTransportMCPServer) for s in new_agent.mcp_servers
+        ):
+            new_agent.mcp_servers = [*new_agent.mcp_servers, nexus_transport_mcp_server]
+
     return new_agent
 
 
@@ -112,10 +142,12 @@ class TemporalOpenAIRunner(AgentRunner):
     def __init__(
         self,
         model_params: ModelActivityParameters,
+        use_nexus_mcp_transport: bool = False,
     ) -> None:
         """Initialize the Temporal OpenAI Runner."""
         self._runner = DEFAULT_AGENT_RUNNER or AgentRunner()
         self.model_params = model_params
+        self._use_nexus_mcp_transport = use_nexus_mcp_transport
 
     def _prepare_workflow_run(
         self,
@@ -130,22 +162,17 @@ class TemporalOpenAIRunner(AgentRunner):
                 )
 
         if starting_agent.mcp_servers:
-            from temporal_agent_harness.ai_sdks.openai_agents._mcp import (
-                _StatefulMCPServerReference,
-                _StatelessMCPServerReference,
-            )
+            from temporal_agent_harness.ai_sdks.openai_agents._mcp import _DurableMCPServerMarker
 
             for s in starting_agent.mcp_servers:
-                if not isinstance(
-                    s,
-                    (
-                        _StatelessMCPServerReference,
-                        _StatefulMCPServerReference,
-                    ),
-                ):
+                if not isinstance(s, _DurableMCPServerMarker):
                     raise ValueError(
                         f"Unknown mcp_server type {type(s)} may not work durably."
                     )
+
+        nexus_transport_mcp_server = None
+        if self._use_nexus_mcp_transport:
+            nexus_transport_mcp_server = _create_nexus_transport_mcp_server()
 
         if isinstance(kwargs.get("session"), SQLiteSession):
             raise ValueError("Temporal workflows don't support SQLite sessions.")
@@ -199,7 +226,9 @@ class TemporalOpenAIRunner(AgentRunner):
                 )
 
         kwargs["run_config"] = run_config
-        return _convert_agent(self.model_params, starting_agent, None, run_context)
+        return _convert_agent(
+            self.model_params, starting_agent, None, run_context, nexus_transport_mcp_server
+        )
 
     async def run(
         self,

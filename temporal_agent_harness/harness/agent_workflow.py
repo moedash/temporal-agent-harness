@@ -1207,7 +1207,6 @@ class _WorkflowStatus:
 # AgentWorkflowRunner
 # ---------------------------------------------------------------------------
 
-
 class AgentWorkflowRunner:
     """Workflow-side agent runtime: discovers ``@agent.accepts`` handlers and dispatches.
 

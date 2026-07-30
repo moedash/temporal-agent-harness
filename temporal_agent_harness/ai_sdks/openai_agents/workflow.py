@@ -343,6 +343,117 @@ def stateful_mcp_server(
     )
 
 
+REGISTER_MCP_SERVER_SIGNAL = "register_mcp_server"
+DEREGISTER_MCP_SERVER_SIGNAL = "deregister_mcp_server"
+
+
+class NexusMcpServerRegistry:
+    """Per-workflow registry of Nexus-reachable MCP tool sources.
+
+    Register via signal from any client::
+
+        await handle.signal(
+            NexusMcpServerRegistry.REGISTER_MCP_SERVER_SIGNAL,
+            args=["demo-tools", "demo-tools-endpoint"],
+        )
+
+    Or call `register` directly from within the workflow.
+    """
+
+    def __init__(self) -> None:
+        self.servers: dict[str, str] = {}
+        """Map storing `{nexus_service_name: nexus_endpoint}`, with a basic CRUD via signal handlers."""
+
+        # Register signal handlers dynamically so the containing workflow doesn't need to.
+        temporal_workflow.set_signal_handler(
+            REGISTER_MCP_SERVER_SIGNAL, self._handle_register
+        )
+        temporal_workflow.set_signal_handler(
+            DEREGISTER_MCP_SERVER_SIGNAL, self._handle_deregister
+        )
+
+    def register(self, name: str, endpoint: str) -> None:
+        """Register (or replace) a Nexus-reachable MCP tool source.
+
+        Args:
+            name: Must match that service's own actual Nexus service name — see the class
+                docstring.
+            endpoint: The Nexus endpoint name that reaches it.
+        """
+        self.servers[name] = endpoint
+        temporal_workflow.logger.info(
+            "[nexus-mcp-registry] registered %r -> %s", name, endpoint
+        )
+
+    def _handle_register(self, name: str, endpoint: str) -> None:
+        self.register(name, endpoint)
+
+    def _handle_deregister(self, name: str) -> None:
+        removed = self.servers.pop(name, None)
+        if removed is not None:
+            temporal_workflow.logger.info("[nexus-mcp-registry] deregistered %r", name)
+        else:
+            temporal_workflow.logger.debug(
+                "[nexus-mcp-registry] deregister: %r not found (stale signal, ignoring)", name
+            )
+
+
+# Stashed on workflow.instance() (stable per execution) -- not a module global, which
+# would leak across concurrently-running workflows on this worker.
+_REGISTRY_INSTANCE_ATTR = "__temporal_agent_harness_nexus_mcp_registry"
+
+
+def nexus_mcp_server_registry() -> NexusMcpServerRegistry:
+    """Return this workflow's `NexusMcpServerRegistry`, creating it on first use.
+
+    One per workflow execution, shared by every caller. This allows us to only have
+    a singleton of the registry of all Nexus MCP servers registerred to this run.
+
+    NOTE: Don't call from ``@workflow.init`` -- ``workflow.instance()`` isn't set yet there.
+          Call from ``@workflow.run`` or a handler instead.
+    """
+    instance = temporal_workflow.instance()
+    registry = getattr(instance, _REGISTRY_INSTANCE_ATTR, None)
+    if registry is None:
+        registry = NexusMcpServerRegistry()
+        setattr(instance, _REGISTRY_INSTANCE_ATTR, registry)
+    return registry
+
+
+def nexus_transport_mcp_server(
+    name: str | None = None,
+    **kwargs: Any,
+) -> AbstractAsyncContextManager["MCPServer"]:
+    """A durable MCP server backed by `nexus_mcp`'s `WorkflowTransport`: tool calls go
+    through Nexus, against whatever's registered in this workflow's `nexus_mcp_server_registry`.
+    Every registered service is available immediately, no separate enable/restrict step for now.
+
+    Prefer to use `OpenAIAgentsPlugin(use_nexus_mcp_transport=True)`, which injects one of these
+    automatically. Call this directly only for a second, differently-configured transport.
+
+    Requires the `nexus-mcp` package.
+
+    Args:
+        name: A readable name for the server. Defaults to `"nexus-transport"` if not provided.
+        **kwargs: Forwarded to `agents.mcp.MCPServer.__init__` (`require_approval`,
+            `failure_error_function`, etc).
+
+    Example:
+        async with nexus_transport_mcp_server() as mcp_server:
+            agent = Agent(name="Assistant", instructions="...", mcp_servers=[mcp_server])
+            result = await Runner.run(agent, input=query)
+    """
+    from temporal_agent_harness.ai_sdks.openai_agents._nexus_mcp import (
+        _NexusTransportMCPServer,
+    )
+
+    return _NexusTransportMCPServer(
+        nexus_mcp_server_registry().servers,
+        name=name,
+        **kwargs,
+    )
+
+
 class ToolSerializationError(TemporalError):
     """Error that occurs when a tool output could not be serialized.
 
