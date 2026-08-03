@@ -1,4 +1,4 @@
-.PHONY: generate install-nexgen build test test-contract vet
+.PHONY: generate install-nexgen build build-lambda lambda-build test test-contract vet
 
 # Installs the newest nex-gen release into `go env GOPATH`/bin, replacing whatever's
 # there if a newer tag exists. We're deliberately tracking latest (not pinning) while
@@ -30,6 +30,25 @@ generate: install-nexgen
 
 build:
 	go build ./...
+
+# Build an AWS Lambda deployment artifact for a cmd/<name> binary.
+# Produces build/<CMD>/bootstrap and build/<CMD>/<CMD>.zip.
+#
+# LAMBDA_ARCH MUST match `Architectures` in deploy/worker-lambda.cfn.yaml (arm64).
+# A mismatch builds and packages fine but fails at invocation with "exec format error".
+# GOWORK=off so the artifact resolves against this module's go.mod, not the workspace.
+LAMBDA_ARCH ?= arm64
+
+# Reusable: `make lambda-build CMD=worker-lambda`
+lambda-build:
+	mkdir -p build/$(CMD)
+	GOWORK=off GOOS=linux GOARCH=$(LAMBDA_ARCH) CGO_ENABLED=0 \
+	  go build -tags lambda.norpc -ldflags="-s -w" -o build/$(CMD)/bootstrap ./cmd/$(CMD)
+	cd build/$(CMD) && rm -f $(CMD).zip && zip -q -X $(CMD).zip bootstrap
+	@echo "Built build/$(CMD)/$(CMD).zip (GOARCH=$(LAMBDA_ARCH))"
+
+build-lambda:
+	$(MAKE) lambda-build CMD=worker-lambda
 
 vet:
 	go vet ./...

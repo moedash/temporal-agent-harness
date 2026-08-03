@@ -4,12 +4,12 @@
 // so go mod tidy works as long as the workspace is active.
 module github.com/temporal-community/temporal-agent-harness/nexus/integration_tests
 
-go 1.25.0
+go 1.25.4
 
 require (
 	github.com/nexus-rpc/sdk-go v0.6.0
 	github.com/stretchr/testify v1.11.1
-	go.temporal.io/api v1.62.3-0.20260330144107-1e2b1facde20
+	go.temporal.io/api v1.62.14
 	go.temporal.io/sdk v1.41.1
 	google.golang.org/protobuf v1.36.10
 )
