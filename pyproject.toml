@@ -104,7 +104,7 @@ include = ["temporal_agent_harness*"]
 # Server-side streams are not in any Python SDK release, so this pins the fork that has them.
 # The pin is an exact commit rather than a branch: a branch would let the same harness revision
 # resolve to different stream implementations over time. See SERVER_STREAMS_README.md.
-temporalio = { git = "https://github.com/moedash/sdk-python", rev = "0a7d2c0b5d9884283336ec8d3d8c26831d894026" }
+temporalio = { git = "https://github.com/moedash/sdk-python", rev = "ab5e35eb2ef9c45ff637eca092b7d77a71f87880" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
