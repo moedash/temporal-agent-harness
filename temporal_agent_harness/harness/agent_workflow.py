@@ -1284,6 +1284,8 @@ class AgentWorkflowRunner:
         # generates its own. workflow.uuid4 is deterministic in-workflow (offline unit tests patch
         # it). Distinct from the full workflow_id, which the model/UI never needs to reproduce.
         self._agent_id: str = config.agent_id or workflow.uuid4().hex[:AGENT_ID_LENGTH]
+        # Kept so an agent still constructs its own stream and the runner does not
+        # decide for it, even though the topic handle below is all this needs now.
         self._stream = stream
         self._events: WorkflowTopicHandle[AgentEvent] = stream.topic(
             TURN_EVENTS_TOPIC, type=AgentEvent
