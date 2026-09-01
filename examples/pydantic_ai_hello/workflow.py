@@ -20,7 +20,7 @@ in ``agents.toml`` and driven by the packaged web app. See ``README.md``.
 from __future__ import annotations
 
 from temporalio import workflow
-from temporalio.contrib.workflow_streams import WorkflowStream
+from temporalio.contrib.server_streams import WorkflowStream
 
 with workflow.unsafe.imports_passed_through():
     from pydantic_ai import Agent

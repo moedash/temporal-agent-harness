@@ -40,7 +40,7 @@ from functools import partial
 from typing import Any, cast
 
 from temporalio import workflow
-from temporalio.contrib.workflow_streams import WorkflowStream
+from temporalio.contrib.server_streams import WorkflowStream
 from temporalio.exceptions import ApplicationError
 from temporalio.workflow import ActivityConfig
 

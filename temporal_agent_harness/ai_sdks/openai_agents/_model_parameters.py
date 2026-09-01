@@ -78,7 +78,7 @@ class ModelActivityParameters:
     calls ``Runner.run_streamed``. Required for ``Runner.run_streamed``;
     if left as ``None``, ``run_streamed`` raises before scheduling any
     activity. The workflow must host a
-    :class:`temporalio.contrib.workflow_streams.WorkflowStream` to receive
+    :class:`temporalio.contrib.server_streams.WorkflowStream` to receive
     the publishes; otherwise the signals are unhandled and dropped.
 
     Streaming is incompatible with ``use_local_activity`` (local activities

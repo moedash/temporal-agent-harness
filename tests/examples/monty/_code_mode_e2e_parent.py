@@ -18,7 +18,7 @@ resolution (the same convention every activity-defining module in this repo foll
 from datetime import timedelta
 
 from temporalio import workflow
-from temporalio.contrib.workflow_streams import WorkflowStream
+from temporalio.contrib.server_streams import WorkflowStream
 from temporalio.workflow import ActivityConfig
 
 with workflow.unsafe.imports_passed_through():

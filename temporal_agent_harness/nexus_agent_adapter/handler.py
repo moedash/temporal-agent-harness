@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from dataclasses import dataclass
 
@@ -14,7 +15,7 @@ from nexusrpc import HandlerError, HandlerErrorType
 from nexusrpc.handler import StartOperationContext, service_handler, sync_operation
 from temporalio import nexus
 from temporalio.client import Client
-from temporalio.contrib.workflow_streams import PollInput, PollResult
+from temporalio.contrib.server_streams import WorkflowStreamClient
 from temporalio.service import RPCError
 
 from temporal_agent_harness.harness.agent_client import (
@@ -62,9 +63,6 @@ from .generated import (
 )
 from .generated import AgentService as AgentServiceDefinition
 
-# WorkflowStream's private poll-update name (not part of its public API), hardcoded since
-# pollMessages must attach to it for any agent without importing that agent's workflow code.
-_WORKFLOW_STREAM_POLL_UPDATE = "__temporal_workflow_stream_poll"
 DEFAULT_POLL_TIMEOUT_SECONDS = 30.0
 _MAX_SEND_RETRIES = 5
 
@@ -178,6 +176,10 @@ class AgentServiceHandler:
         )
         client = self._agent_client(input.session_id)
 
+        # Where the caller should start reading, taken before the message goes
+        # in so it cannot be past this turn's first event.
+        stream_head = await client.event_tail()
+
         # Nexus callers don't know expected_turn; guess 1, then re-derive from status on retry.
         expected_turn = 1
         for attempt in range(_MAX_SEND_RETRIES):
@@ -201,7 +203,7 @@ class AgentServiceHandler:
             return SendMessageOutput(
                 turn_number=reply.turn_number,
                 turn_id=reply.turn_id,
-                stream_head_offset=reply.accepted_offset,
+                stream_head_offset=stream_head,
                 pending=reply.pending,
             )
         raise HandlerError(
@@ -329,7 +331,7 @@ class AgentServiceHandler:
         )
 
     # -----------------------------------------------------------------------
-    # pollMessages — async operation backed by WorkflowStream's poll update
+    # pollMessages — reads the agent's stream
     # -----------------------------------------------------------------------
 
     @nexus.temporal_operation
@@ -339,39 +341,37 @@ class AgentServiceHandler:
         client: nexus.TemporalNexusClient,
         input: PollMessagesInput,
     ) -> nexus.TemporalOperationResult[PollMessagesOutput]:
-        """Long-polls WorkflowStream via update-with-callback. Returns closed=True
-        synchronously if the target workflow has already completed."""
-        workflow_id = self._workflow_id(input.session_id)
-        timeout_seconds = input.timeout_seconds or DEFAULT_POLL_TIMEOUT_SECONDS
+        """Reads the agent's event stream, waiting for the next event if there is none.
 
-        try:
-            result = await client.start_workflow_update(
-                workflow_id,
-                _WORKFLOW_STREAM_POLL_UPDATE,
-                PollInput(from_offset=input.cursor, topics=[TURN_EVENTS_TOPIC]),
-                result_type=PollResult,
-            )
-        except RPCError as e:
-            if _is_workflow_already_completed(e):
-                return nexus.TemporalOperationResult.sync(
-                    PollMessagesOutput(
-                        items=[], more_ready=False, next_offset=input.cursor, closed=True
-                    )
-                )
-            raise
-
-        if result.token is not None:
-            return nexus.TemporalOperationResult.async_token(result.token)
-
-        poll_result: PollResult = result.value
+        Answered here rather than handed back as an async token. The Workflow
+        Streams version had to park an Update on the agent's Workflow and attach
+        a completion callback to it, because an Update was the only thing that
+        could wait. A stream is read with a call that blocks until something
+        arrives, so there is nothing to park, nothing to attach to, and no
+        in-flight Update held against the agent while a caller is idle.
+        """
+        stream = WorkflowStreamClient.create(
+            self._client, self._workflow_id(input.session_id)
+        )
+        page = await asyncio.wait_for(
+            stream.poll_raw(topics=[TURN_EVENTS_TOPIC], from_offset=input.cursor),
+            timeout=input.timeout_seconds or DEFAULT_POLL_TIMEOUT_SECONDS,
+        )
         return nexus.TemporalOperationResult.sync(
             PollMessagesOutput(
                 items=[
-                    StreamItem(topic=item.topic, data=item.data, offset=item.offset)
-                    for item in poll_result.items
+                    StreamItem(
+                        topic=item.topic,
+                        data=base64.b64encode(item.data).decode(),
+                        offset=item.offset,
+                    )
+                    for item in page.items
                 ],
-                more_ready=poll_result.more_ready,
-                next_offset=poll_result.next_offset,
-                closed=False,
+                more_ready=page.next_offset < page.head_offset,
+                next_offset=page.next_offset,
+                # A finished agent whose events are all delivered. The stream
+                # outlives the Workflow, so this is the end of the events and
+                # not the end of the ability to read them.
+                closed=page.closed and page.next_offset >= page.head_offset,
             )
         )

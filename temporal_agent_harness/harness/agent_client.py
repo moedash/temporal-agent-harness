@@ -11,8 +11,11 @@ import asyncio
 from collections.abc import AsyncIterator, Callable
 from typing import Any, TypeVar
 
+import grpc
+from grpc.aio import AioRpcError
+
 from temporalio.client import Client, WithStartWorkflowOperation, WorkflowUpdateFailedError
-from temporalio.contrib.workflow_streams import WorkflowStreamClient
+from temporalio.contrib.server_streams import WorkflowStreamClient
 
 from temporalio.common import WorkflowIDConflictPolicy
 
@@ -423,8 +426,9 @@ class AgentClient:
 
         Phase 1, :meth:`_submit_message`, runs eagerly here so ``StaleTurnError`` /
         ``AgentBusyError`` are raised *before* any streaming begins (and before the merge is even
-        constructed — there is no failure path after the agent has accepted). The update returns an
-        ``accepted_offset``; phase 2 then drives the client-side stream-merge from there: it skips
+        constructed — there is no failure path after the agent has accepted). The client snapshots
+        the stream's tail before submitting; phase 2 then drives the stream-merge from there: it
+        skips
         to this turn's ``turn_started`` (a quiescent start) and yields every event of the turn,
         coalescing the agent's own stream with each subagent stream it drives (recursively), in a
         semantically-valid order — through to this turn's ``turn_end``. The caller never tracks or
@@ -456,25 +460,48 @@ class AgentClient:
             StaleTurnError: The client is behind the workflow.
             AgentBusyError: The agent is busy and does not support enqueuing.
         """
+        # Taken before the update, so it cannot be past this turn's
+        # ``turn_started``, which is all the merge needs of it.
+        from_offset = await self.event_tail()
         reply = await self._submit_message(msg_type, payload, expected_turn)
         return self._merged_turn(
             reply,
+            from_offset=from_offset,
             on_item=on_item,
             timeout=timeout,
             stall_grace_seconds=subagent_stall_grace_seconds,
         )
 
+    async def event_tail(self) -> int:
+        """Where this agent's event stream currently ends.
+
+        A session that has not been started yet has published nothing, so its
+        stream begins at zero rather than being an error. The gateway asks for
+        this before starting an agent, so that is a normal state and not a
+        mistyped id.
+        """
+        try:
+            return await WorkflowStreamClient.create(
+                self._temporal, self._workflow_id
+            ).get_offset()
+        except AioRpcError as e:
+            if e.code() is not grpc.StatusCode.NOT_FOUND:
+                raise
+            return 0
+
     async def _merged_turn(
         self,
         reply: AgentMessageReply,
         *,
+        from_offset: int,
         on_item: OnItemCallback[T],
         timeout: float | None,
         stall_grace_seconds: float,
     ) -> AsyncIterator[T]:
         """Phase 2 of :meth:`send_message`: drive the merge for one submitted turn.
 
-        Reads from ``reply.accepted_offset`` and skips to ``reply.turn_id``'s ``turn_started``,
+        Reads from the tail captured before submission and skips to ``reply.turn_id``'s
+        ``turn_started``,
         then merges live (arrival-order interleaving) until that turn's ``turn_end`` on the ROOT
         agent — by which point, via the close gate, every subagent turn it triggered has already
         been emitted. The turn's own terminal error is surfaced as an :class:`AgentTurnError`
@@ -492,7 +519,7 @@ class AgentClient:
         merged = merge_stream(
             client=self._temporal,
             root_workflow_id=self._workflow_id,
-            root_from_offset=reply.accepted_offset,
+            root_from_offset=from_offset,
             skip_until_turn_id=target_turn_id,
             select=select_live,
             should_stop=should_stop,
@@ -578,9 +605,8 @@ class AgentClient:
         root event that existed when it started. This lets a replay that ends with
         out-of-band operator commands drain them without waiting for a nonexistent turn.
         """
-        stream = WorkflowStreamClient.create(self._temporal, self._workflow_id)
         status = await self.get_status()
-        head = await stream.get_offset()
+        head = await self.event_tail()
         # Already caught up (no events past from_offset) and the agent is idle — nothing to stream.
         if head <= from_offset and not status.turn_active and not status.pending_turns:
             return self._empty()

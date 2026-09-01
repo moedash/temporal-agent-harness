@@ -28,8 +28,10 @@ from pydantic import BaseModel
 from temporalio import workflow
 from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.contrib.workflow_streams import WorkflowStream, WorkflowStreamClient
+from temporalio.contrib.server_streams import WorkflowStream, WorkflowStreamClient
 from temporalio.testing import WorkflowEnvironment
+
+from tests._stream_env import stream_workflow_environment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
 from temporal_agent_harness.harness import AgentWorkflowRunner, agent
@@ -137,7 +139,7 @@ class CallbackProbeAgent:
 
 @pytest_asyncio.fixture
 async def env_and_client():
-    env = await WorkflowEnvironment.start_time_skipping(
+    env = await stream_workflow_environment(
         data_converter=pydantic_data_converter
     )
     task_queue = f"callback-test-{uuid.uuid4()}"
