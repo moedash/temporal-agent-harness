@@ -37,7 +37,7 @@ from typing import (
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from temporalio import activity, workflow
-from temporalio.contrib.workflow_streams import (
+from temporalio.contrib.server_streams import (
     TopicHandle,
     WorkflowStream,
     WorkflowStreamClient,
@@ -1284,9 +1284,8 @@ class AgentWorkflowRunner:
         # generates its own. workflow.uuid4 is deterministic in-workflow (offline unit tests patch
         # it). Distinct from the full workflow_id, which the model/UI never needs to reproduce.
         self._agent_id: str = config.agent_id or workflow.uuid4().hex[:AGENT_ID_LENGTH]
-        # Retain the WorkflowStream itself (not just the topic handle) so the runner can read
-        # the stream's current head offset in-workflow — see ``_handle_send_agent_message``,
-        # which returns it as ``AgentMessageReply.accepted_offset`` for the client stream-merge.
+        # Kept so an agent still constructs its own stream and the runner does not
+        # decide for it, even though the topic handle below is all this needs now.
         self._stream = stream
         self._events: WorkflowTopicHandle[AgentEvent] = stream.topic(
             TURN_EVENTS_TOPIC, type=AgentEvent
@@ -1358,14 +1357,6 @@ class AgentWorkflowRunner:
     # -- Protocol handlers --------------------------------------------------
 
     async def _handle_send_agent_message(self, message: AgentMessage) -> AgentMessageReply:
-        # Capture the stream head BEFORE publishing anything for this message: it is the
-        # client stream-merge's read-start hint (``accepted_offset``). The handler body is
-        # synchronous (no await that yields), so this runs atomically before the turn loop can
-        # publish this turn's ``turn_started`` — guaranteeing ``accepted_offset <= turn_started``,
-        # which is all the merge requires (it discards events up to ``turn_started``). Read the
-        # real log head (``_on_offset``), not a publish counter: activity-published events enter
-        # the same global log via signals and would be missed by an in-workflow counter.
-        accepted_offset = self._stream._on_offset()
         turn_id = str(workflow.uuid4())
         pending = self._status.has_pending_work
         turn_number = self._status.enqueue_message(message, turn_id)
@@ -1380,7 +1371,6 @@ class AgentWorkflowRunner:
         return AgentMessageReply(
             turn_number=turn_number,
             turn_id=turn_id,
-            accepted_offset=accepted_offset,
             pending=pending,
         )
 

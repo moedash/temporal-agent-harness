@@ -24,7 +24,7 @@ from contextlib import (
 from datetime import timedelta
 from typing import Any, AsyncIterator, Callable, Optional, Protocol, TypeVar
 
-from temporalio.contrib.workflow_streams import WorkflowStreamClient
+from temporalio.contrib.server_streams import WorkflowStreamClient
 
 __all__ = [
     "StreamObserver",

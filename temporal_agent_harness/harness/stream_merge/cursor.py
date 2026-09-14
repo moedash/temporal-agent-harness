@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator
 from datetime import timedelta
 
 from temporalio.client import Client
-from temporalio.contrib.workflow_streams import (
+from temporalio.contrib.server_streams import (
     WorkflowStreamClient,
     WorkflowStreamItem,
 )

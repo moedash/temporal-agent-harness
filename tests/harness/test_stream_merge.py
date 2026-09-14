@@ -18,7 +18,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from temporalio.contrib.workflow_streams import WorkflowStreamItem
+from temporalio.contrib.server_streams import WorkflowStreamItem
 
 import temporal_agent_harness.harness.stream_merge.cursor as cursor_mod
 from temporal_agent_harness.harness.agent_protocol import (

@@ -15,9 +15,12 @@ import pytest_asyncio
 from pydantic import BaseModel
 from temporalio import workflow
 from temporalio.api.enums.v1 import EventType
+from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.contrib.workflow_streams import WorkflowStream
+from temporalio.contrib.server_streams import WorkflowStream
 from temporalio.testing import WorkflowEnvironment
+
+from tests._stream_env import stream_server_target
 from temporalio.worker import Worker
 
 from temporal_agent_harness.harness import AgentWorkflowRunner, agent
@@ -139,16 +142,25 @@ class CallerWorkflow:
 
 @pytest_asyncio.fixture(scope="module")
 async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
-    env = await WorkflowEnvironment.start_local(
-        data_converter=pydantic_data_converter,
-        dev_server_download_version=_DEV_SERVER_VERSION,
-        dev_server_extra_args=_DEV_SERVER_ARGS,
-    )
+    target = stream_server_target()
+    if target:
+        # The dev server has no stream service, so this runs against a server
+        # built from the prototype branch. Its config has to carry the same
+        # dynamic config as _DEV_SERVER_ARGS below.
+        env = WorkflowEnvironment.from_client(
+            await Client.connect(target, data_converter=pydantic_data_converter)
+        )
+    else:
+        env = await WorkflowEnvironment.start_local(
+            data_converter=pydantic_data_converter,
+            dev_server_download_version=_DEV_SERVER_VERSION,
+            dev_server_extra_args=_DEV_SERVER_ARGS,
+        )
     yield env
     await env.shutdown()
 
 
-async def test_poll_messages_delivers_via_async_callback(env: WorkflowEnvironment) -> None:
+async def test_poll_messages_delivers_without_parking_an_update(env: WorkflowEnvironment) -> None:
     client = env.client
     endpoint_name = f"agent-endpoint-{uuid.uuid4()}"
     agent_task_queue = f"agent-{uuid.uuid4()}"
@@ -192,10 +204,13 @@ async def test_poll_messages_delivers_via_async_callback(env: WorkflowEnvironmen
             "pollMessages must deliver the reply's stream items"
         )
 
-        # Proves the async callback path was taken, not a sync completion.
+        # The operation answered rather than going async. Under Workflow Streams it had to
+        # park an Update on the agent and hand back a completion token, because an Update was
+        # the only thing that could wait for an event. A stream read waits on the server, so
+        # there is nothing parked on the agent while a caller is idle.
         history = await handle.fetch_history()
         op_types = {e.event_type for e in history.events}
-        assert EventType.EVENT_TYPE_NEXUS_OPERATION_STARTED in op_types
+        assert EventType.EVENT_TYPE_NEXUS_OPERATION_STARTED not in op_types
         assert EventType.EVENT_TYPE_NEXUS_OPERATION_COMPLETED in op_types
 
 

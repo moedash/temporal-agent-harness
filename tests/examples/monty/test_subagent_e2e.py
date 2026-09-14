@@ -17,8 +17,10 @@ import uuid
 import pytest_asyncio
 from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.contrib.workflow_streams import WorkflowStreamClient
+from temporalio.contrib.server_streams import WorkflowStreamClient
 from temporalio.testing import WorkflowEnvironment
+
+from tests._stream_env import stream_workflow_environment
 from temporalio.worker import Worker
 
 from temporal_agent_harness.harness.agent_protocol import (
@@ -47,7 +49,7 @@ from ._subagent_e2e_parent import (
 
 @pytest_asyncio.fixture
 async def client_and_queue():
-    env = await WorkflowEnvironment.start_time_skipping(
+    env = await stream_workflow_environment(
         data_converter=pydantic_data_converter
     )
     task_queue = f"subagent-e2e-{uuid.uuid4()}"
@@ -352,13 +354,15 @@ async def test_operator_command_can_target_live_subagent_directly(client_and_que
     assert operator_events[-1].event.text == result.text
 
 
-async def test_attach_after_stopped_subagent_degrades_gracefully(client_and_queue):
-    # The REAL graceful-degradation path (distinct from the LIVE merge above, which reads the
-    # child's detail in real time BEFORE the end-of-turn stop completes the child): here we drive
-    # the subagent and STOP it, so by the time we REATTACH it is a COMPLETED workflow. workflow_streams
-    # cannot read a completed workflow's stream, so the merge cannot mount the stopped child on
-    # replay — it must DEGRADE rather than wedge: release the child's close gate so the parent renders
-    # to its turn_end, and surface a non-fatal subagent_stream_unavailable marker for the child.
+async def test_attach_after_stopped_subagent_still_replays_its_detail(client_and_queue):
+    # A subagent driven and then STOPPED, so by the time we REATTACH it is a completed workflow.
+    # Under Workflow Streams a completed workflow's stream could not be read, so the merge had to
+    # degrade: release the child's close gate, render the parent to its turn_end, and surface a
+    # non-fatal subagent_stream_unavailable marker in place of the child's detail.
+    #
+    # A stream outlives its workflow, so there is nothing to degrade from. The stopped child
+    # replays in full and no marker is produced. The degradation path is still there for a child
+    # whose stream really is unreachable; it just is not reached by a child that merely finished.
     client, task_queue = client_and_queue
     parent_id, _live = await _merged_send(
         client, task_queue, [_const_script(42), _const_script(99)], stop=True
@@ -382,26 +386,24 @@ async def test_attach_after_stopped_subagent_degrades_gracefully(client_and_queu
     assert len(child_ids) == 1
     child_id = next(iter(child_ids))
 
-    # The parent stream rendered FULLY despite the unreadable child — its turn_end is present (the
-    # dead child's never-coming turn_end did not strand the parent's tail behind the close gate).
+    # The parent rendered fully: its turn_end is present, so the child's close gate was satisfied
+    # by the child's own turn_end rather than by the merge giving up on it.
     parent_events = [e for e in attached if e.agent_id != child_id]
     assert parent_events[-1].event.type == AgentEventType.TURN_END
 
-    # A non-fatal marker was surfaced for the stopped subagent (its own turn DETAIL is forgone), and
-    # no actual child turn detail leaked onto the merged stream.
+    # No marker, because nothing was forgone.
     markers = [
         e
         for e in attached
         if e.event.type == AgentEventType.SUBAGENT_STREAM_UNAVAILABLE
     ]
-    assert markers and all(m.event.subagent_id == child_id for m in markers)
-    child_detail = [
-        e
-        for e in attached
-        if e.agent_id == child_id
-        and e.event.type != AgentEventType.SUBAGENT_STREAM_UNAVAILABLE
-    ]
-    assert not child_detail
+    assert not markers
+
+    # The stopped child's own turn is on the merged stream, bracketed as a live one would be.
+    child_detail = [e for e in attached if e.agent_id == child_id]
+    assert child_detail
+    assert child_detail[0].event.type == AgentEventType.TURN_STARTED
+    assert child_detail[-1].event.type == AgentEventType.TURN_END
 
 
 async def test_gated_concurrent_dispatches_get_distinct_turn_numbers(client_and_queue):

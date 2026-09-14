@@ -13,8 +13,10 @@ import uuid
 import pytest_asyncio
 from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.contrib.workflow_streams import WorkflowStreamClient
+from temporalio.contrib.server_streams import WorkflowStreamClient
 from temporalio.testing import WorkflowEnvironment
+
+from tests._stream_env import stream_workflow_environment
 from temporalio.worker import Worker
 
 from temporal_agent_harness.harness import agent
@@ -34,7 +36,7 @@ from ._code_mode_e2e_parent import CODE_MODE_TOOLS, CodeModeE2EParentWorkflow
 
 @pytest_asyncio.fixture
 async def client_and_queue():
-    env = await WorkflowEnvironment.start_time_skipping(
+    env = await stream_workflow_environment(
         data_converter=pydantic_data_converter
     )
     task_queue = f"code-mode-e2e-{uuid.uuid4()}"

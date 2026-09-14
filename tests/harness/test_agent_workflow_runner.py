@@ -26,8 +26,10 @@ from pydantic import BaseModel
 from temporalio import workflow
 from temporalio.client import Client, WorkflowHandle, WorkflowUpdateFailedError
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.contrib.workflow_streams import WorkflowStream
+from temporalio.contrib.server_streams import WorkflowStream
 from temporalio.testing import WorkflowEnvironment
+
+from tests._stream_env import stream_workflow_environment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
 from temporal_agent_harness.harness import AgentWorkflowRunner, agent, slash_commands
@@ -185,7 +187,7 @@ class SlashExtensionProbeAgent:
 @pytest_asyncio.fixture
 async def client_and_queue():
     """A time-skipping env (pydantic converter) with a worker hosting the probe."""
-    env = await WorkflowEnvironment.start_time_skipping(
+    env = await stream_workflow_environment(
         data_converter=pydantic_data_converter
     )
     task_queue = f"agent-workflow-runner-test-{uuid.uuid4()}"
@@ -530,7 +532,7 @@ async def test_configured_core_command_preempts_agent_extension(
 async def _collect_until_turn_end(client: Client, workflow_id: str) -> list[AgentEvent]:
     from datetime import timedelta
 
-    from temporalio.contrib.workflow_streams import WorkflowStreamClient
+    from temporalio.contrib.server_streams import WorkflowStreamClient
 
     stream = WorkflowStreamClient.create(client, workflow_id)
     events: list[AgentEvent] = []
@@ -552,7 +554,7 @@ async def _collect_until_operator_terminal(
 ) -> list[AgentEvent]:
     from datetime import timedelta
 
-    from temporalio.contrib.workflow_streams import WorkflowStreamClient
+    from temporalio.contrib.server_streams import WorkflowStreamClient
 
     stream = WorkflowStreamClient.create(client, workflow_id)
     events: list[AgentEvent] = []
