@@ -27,9 +27,10 @@ import pytest_asyncio
 from temporalio import workflow
 from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.contrib.workflow_streams import WorkflowStream, WorkflowStreamClient
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+
+from tests._streams import turn_events, worker_options, workflow_environment
 
 from temporal_agent_harness.harness import AgentWorkflowRunner, agent
 from temporal_agent_harness.harness.agent import ToolApprovalContext, ToolApprovalPolicy
@@ -124,7 +125,6 @@ class ApprovalProbeAgent(_BaseProbe):
     def __init__(self, config: AgentConfig) -> None:
         self._runner = AgentWorkflowRunner(
             config,
-            stream=WorkflowStream(),
             # Safe-by-default baseline: gate everything. Tests relax it per session via
             # AgentConfig.approval_policy.
             approval_policy_default=ToolApprovalPolicy.always_require_approvals(),
@@ -153,7 +153,6 @@ class CustomFallbackProbeAgent(_BaseProbe):
     def __init__(self, config: AgentConfig) -> None:
         self._runner = AgentWorkflowRunner(
             config,
-            stream=WorkflowStream(),
             approval_policy_default=ToolApprovalPolicy.always_require_approvals(),
             custom_approval_fallback=_approve_gated_activity_tool,
         )
@@ -175,12 +174,13 @@ class CustomFallbackProbeAgent(_BaseProbe):
 
 @pytest_asyncio.fixture
 async def env_and_client():
-    env = await WorkflowEnvironment.start_time_skipping(
+    env = await workflow_environment(
         data_converter=pydantic_data_converter
     )
     task_queue = f"approval-test-{uuid.uuid4()}"
     async with Worker(
         env.client,
+        **worker_options(),
         task_queue=task_queue,
         workflows=[ApprovalProbeAgent, CustomFallbackProbeAgent],
         activities=[
@@ -220,21 +220,15 @@ async def _send(handle, text: str, expected_turn: int) -> None:
 
 
 def _subscribe(client: Client, workflow_id: str):
-    stream = WorkflowStreamClient.create(client, workflow_id)
-    return stream.subscribe(
-        topics=[TURN_EVENTS_TOPIC],
-        from_offset=0,
-        result_type=AgentEvent,
-        poll_cooldown=timedelta(milliseconds=10),
-    )
+    return turn_events(client, workflow_id)
 
 
 async def _drain_to_turn_end(client: Client, workflow_id: str) -> list[AgentEvent]:
     events: list[AgentEvent] = []
     async with asyncio.timeout(30):
         async for item in _subscribe(client, workflow_id):
-            events.append(item.data)
-            if item.data.event.type == AgentEventType.TURN_END:
+            events.append(item)
+            if item.event.type == AgentEventType.TURN_END:
                 break
     return events
 
@@ -265,7 +259,7 @@ async def test_approved_tool_executes_after_approval(env_and_client):
     events: list[AgentEvent] = []
     async with asyncio.timeout(30):
         async for item in _subscribe(client, handle.id):
-            ev = item.data
+            ev = item
             events.append(ev)
             if (
                 ev.event.type == AgentEventType.TOOL_APPROVAL_REQUESTED
@@ -302,7 +296,7 @@ async def test_denied_tool_does_not_execute(env_and_client):
     events: list[AgentEvent] = []
     async with asyncio.timeout(30):
         async for item in _subscribe(client, handle.id):
-            ev = item.data
+            ev = item
             events.append(ev)
             if (
                 ev.event.type == AgentEventType.TOOL_APPROVAL_REQUESTED
@@ -360,7 +354,7 @@ async def test_always_require_gates_even_inherently_safe(env_and_client):
     events: list[AgentEvent] = []
     async with asyncio.timeout(30):
         async for item in _subscribe(client, handle.id):
-            ev = item.data
+            ev = item
             events.append(ev)
             if (
                 ev.event.type == AgentEventType.TOOL_APPROVAL_REQUESTED
@@ -476,7 +470,7 @@ async def test_remember_allowlists_tool_and_cascades_to_pending(env_and_client):
     events: list[AgentEvent] = []
     async with asyncio.timeout(30):
         async for item in _subscribe(client, handle.id):
-            ev = item.data
+            ev = item
             events.append(ev)
             if ev.event.type == AgentEventType.TOOL_APPROVAL_REQUESTED:
                 requested.add(ev.event.tool_id)
@@ -531,7 +525,7 @@ async def test_remember_resolution_is_causally_ordered_before_cascade(env_and_cl
     resolved_order: list[str] = []
     async with asyncio.timeout(30):
         async for item in _subscribe(client, handle.id):
-            ev = item.data
+            ev = item
             if ev.event.type == AgentEventType.TOOL_APPROVAL_REQUESTED:
                 requested.add(ev.event.tool_id)
                 # Approve the SECOND-registered call (act-B) — the harder ordering case.
@@ -562,8 +556,8 @@ async def test_pending_approval_visible_in_status(env_and_client):
     async with asyncio.timeout(30):
         async for item in _subscribe(client, handle.id):
             if (
-                item.data.event.type == AgentEventType.TOOL_APPROVAL_REQUESTED
-                and item.data.event.tool_id == "g1"
+                item.event.type == AgentEventType.TOOL_APPROVAL_REQUESTED
+                and item.event.tool_id == "g1"
             ):
                 break
 
@@ -586,8 +580,8 @@ async def test_approval_is_idempotent(env_and_client):
     async with asyncio.timeout(30):
         async for item in _subscribe(client, handle.id):
             if (
-                item.data.event.type == AgentEventType.TOOL_APPROVAL_REQUESTED
-                and item.data.event.tool_id == "g1"
+                item.event.type == AgentEventType.TOOL_APPROVAL_REQUESTED
+                and item.event.tool_id == "g1"
             ):
                 break
 
@@ -617,7 +611,7 @@ async def test_concurrent_first_approved_executes_first(env_and_client):
     events: list[AgentEvent] = []
     async with asyncio.timeout(30):
         async for item in _subscribe(client, handle.id):
-            ev = item.data
+            ev = item
             events.append(ev)
             t = ev.event.type
             if t == AgentEventType.TOOL_APPROVAL_REQUESTED:
@@ -650,10 +644,10 @@ async def test_close_while_pending_auto_denies(env_and_client):
     pre_close: list[AgentEvent] = []
     async with asyncio.timeout(30):
         async for item in _subscribe(client, handle.id):
-            pre_close.append(item.data)
+            pre_close.append(item)
             if (
-                item.data.event.type == AgentEventType.TOOL_APPROVAL_REQUESTED
-                and item.data.event.tool_id == "g1"
+                item.event.type == AgentEventType.TOOL_APPROVAL_REQUESTED
+                and item.event.tool_id == "g1"
             ):
                 await handle.signal("close")
                 break
@@ -675,7 +669,7 @@ async def test_inline_workflow_tool_gates(env_and_client):
     events: list[AgentEvent] = []
     async with asyncio.timeout(30):
         async for item in _subscribe(client, handle.id):
-            ev = item.data
+            ev = item
             events.append(ev)
             if (
                 ev.event.type == AgentEventType.TOOL_APPROVAL_REQUESTED

@@ -44,6 +44,8 @@ from temporal_agent_harness.harness.agent_protocol import (
     OperatorCommandResult,
     SEND_AGENT_MESSAGE_UPDATE,
 )
+from temporal_agent_harness.harness.stream_merge import ResumePoint
+from temporal_agent_harness.harness.stream_transport import configure_from_env
 from temporal_agent_harness.ui import packaged_ui_dist
 from temporal_agent_harness.utils.large_payload import with_large_payload_offload
 from temporal_agent_harness.web.registry import load_agent_registry
@@ -130,6 +132,8 @@ def create_agent_harness_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # This process reads agent streams, so it names its provider like a worker does.
+        configure_from_env()
         connect_config = ClientConfig.load_client_connect_config()
         app.state.temporal = await Client.connect(
             **connect_config,
@@ -236,10 +240,10 @@ def create_agent_harness_app(
         return JSONResponse(content=content, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/attach")
-    async def attach(session_id: str, from_offset: int = 0) -> StreamingResponse:
+    async def attach(session_id: str, resume: str = "") -> StreamingResponse:
         client = AgentClient(temporal=app.state.temporal, workflow_id=session_id)
         return StreamingResponse(
-            await client.attach(on_item=_yield_item, from_offset=from_offset),
+            await client.attach(on_item=_yield_item, resume=resume),
             media_type="text/event-stream",
             headers=_sse_headers(),
         )
@@ -287,22 +291,22 @@ def create_agent_harness_app(
 
     @app.post("/api/chat")
     async def chat(req: ChatRequestBody):
-        def on_item(item: AgentStreamOutput, resume_offset: int) -> bytes:
+        def on_item(item: AgentStreamOutput, resume: ResumePoint) -> bytes:
             match item:
                 case AgentTurnTimeout():
                     return _sse(
                         AgentEventType.ERROR,
                         {"kind": "timeout", "message": str(item)},
-                        resume_offset,
+                        resume,
                     )
                 case AgentTurnError():
                     return _sse(
                         AgentEventType.ERROR,
                         {"kind": "agent", "message": str(item)},
-                        resume_offset,
+                        resume,
                     )
                 case _:
-                    return _yield_item(item, resume_offset)
+                    return _yield_item(item, resume)
 
         client = AgentClient(temporal=app.state.temporal, workflow_id=req.session_id)
         if isinstance(req.message, str):
@@ -619,14 +623,15 @@ def _mount_static_ui(
         raise HTTPException(status_code=404)
 
 
-def _sse(event: str, data: dict, resume_offset: int | None = None) -> bytes:
+def _sse(event: str, data: dict, resume: ResumePoint | None = None) -> bytes:
     payload = {**data}
-    if resume_offset is not None:
-        payload["resume_offset"] = resume_offset
+    if resume is not None:
+        # The encoded point a browser hands back to ``/api/attach?resume=`` after a disconnect.
+        payload["resume"] = resume.encode()
     return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
 
 
-def _yield_item(item, resume_offset: int | None = None) -> bytes:
+def _yield_item(item, resume: ResumePoint | None = None) -> bytes:
     if isinstance(item, AgentEvent):
         payload = item.event
         data = {
@@ -636,7 +641,7 @@ def _yield_item(item, resume_offset: int | None = None) -> bytes:
             "turn_number": item.turn_number,
             "timestamp": item.timestamp,
         }
-        return _sse(payload.type, data, resume_offset)
+        return _sse(payload.type, data, resume)
     return b""
 
 

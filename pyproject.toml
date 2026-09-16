@@ -8,7 +8,7 @@ requires-python = ">=3.11"
 # pydantic. AI-SDK and external-storage needs are opt-in extras below, so installing the
 # harness doesn't drag in Gemini or boto3.
 dependencies = [
-    "temporalio>=1.30.0",  # provides temporalio.contrib.workflow_streams (experimental)
+    "temporalio>=1.30.0",  # provides temporalio.streams (the AI-198 stream interface, prototype)
     "pydantic>=2.0",
 ]
 
@@ -101,7 +101,7 @@ include = ["temporal_agent_harness*"]
 [tool.uv.sources]
 # For now we need to pin to an unreleased Python SDK version that has update-with-callback over Nexus.
 # TODO(long-nt-tran): Remove this commit pin and use a released version once the release is bumped.
-temporalio = { git = "https://github.com/temporalio/sdk-python", rev = "29e0c51b0f832e0c9148f28ebba4000ab183d42f" }
+temporalio = { git = "https://github.com/moedash/sdk-python", rev = "a76d61463335d3f6dea6d3961021106f6cd4968f" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

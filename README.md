@@ -205,7 +205,6 @@ from datetime import timedelta
 
 from pydantic import BaseModel
 from temporalio import workflow
-from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.workflow import ActivityConfig
 
 from temporal_agent_harness.harness import AgentWorkflowRunner, agent, slash_commands
@@ -240,7 +239,6 @@ class TravelAgent:
         # statically declare themselves inherently safe.
         self._runner = AgentWorkflowRunner(
             config,
-            stream=WorkflowStream(),
             approval_policy_default=ToolApprovalPolicy.allow_inherently_safe(),
             slash_commands=slash_commands.default_commands(),
         )
@@ -343,7 +341,6 @@ from temporal_agent_harness.harness import slash_commands
 
 self._runner = AgentWorkflowRunner(
     config,
-    stream=WorkflowStream(),
     approval_policy_default=ToolApprovalPolicy.always_require_approvals(),
     slash_commands=slash_commands.commands("approvals", "status", "stop"),
 )
@@ -364,7 +361,6 @@ SUPPORTED_MODELS = ("gemini-3.5-flash", "gemini-3.1-flash-lite")
 
 self._runner = AgentWorkflowRunner(
     config,
-    stream=WorkflowStream(),
     approval_policy_default=ToolApprovalPolicy.always_require_approvals(),
     slash_commands=[
         *slash_commands.default_commands(),
@@ -398,6 +394,22 @@ just app-install
 Set the creds for whichever agents you'll run: `OPENAI_API_KEY` (react_agent, openai_hello,
 pydantic_ai_hello) and/or `GEMINI_API_KEY` (monty, wiki, coding). The default committed
 `temporal.local.toml` profile points at a local Temporal dev server.
+
+### Choosing the stream provider
+
+Agents publish their turn events through `temporalio.streams`, and the store behind it is a
+per-process choice made from the environment. Workers, the web app, and the Nexus adapter all read
+`STREAMS_PROVIDER` at startup; agent code names nothing.
+
+| `STREAMS_PROVIDER` | Where events live | Needs |
+|---|---|---|
+| `workflow_streams` (default) | The workflow's own History (today's Workflow Streams) | Nothing |
+| `redis` | A Redis named by `AI198_REDIS_URL` | `pip install redis` |
+| `native` | Streams carried by the Temporal server | A server built from the stream branch |
+| `memory` | This process | Nothing; for tests |
+
+The test suite honours the same variable (`STREAMS_PROVIDER=redis uv run pytest`), and for
+`native` connects to the server `TEMPORAL_ADDRESS` names instead of starting the test server.
 
 ### One example, standalone
 

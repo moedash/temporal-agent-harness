@@ -15,9 +15,10 @@ import uuid
 import pytest_asyncio
 from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.contrib.workflow_streams import WorkflowStreamClient
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
+
+from tests._streams import turn_events, worker_options, workflow_environment
 
 from temporal_agent_harness.harness.agent_protocol import (
     SEND_AGENT_MESSAGE_UPDATE,
@@ -37,12 +38,13 @@ from examples.monty.workflow import MontyDynamicAgentWorkflow
 
 @pytest_asyncio.fixture
 async def client_and_queue():
-    env = await WorkflowEnvironment.start_time_skipping(
+    env = await workflow_environment(
         data_converter=pydantic_data_converter
     )
     task_queue = f"monty-agent-test-{uuid.uuid4()}"
     async with Worker(
         env.client,
+        **worker_options(),
         task_queue=task_queue,
         workflows=[MontyDynamicAgentWorkflow],
         activities=[*activities.ALL_ACTIVITIES, *CODE_MODE_ACTIVITIES],
@@ -54,14 +56,8 @@ async def client_and_queue():
 
 
 async def _reply_text(client: Client, workflow_id: str) -> str:
-    stream = WorkflowStreamClient.create(client, workflow_id)
     reply: str | None = None
-    async for item in stream.subscribe(
-        topics=[TURN_EVENTS_TOPIC],
-        from_offset=0,
-        result_type=AgentEvent,
-    ):
-        envelope: AgentEvent = item.data
+    async for envelope in turn_events(client, workflow_id):
         if envelope.event.type == AgentEventType.REPLY:
             # run_script returns a TextReply; read its text off the output dict.
             reply = envelope.event.output.get("text")

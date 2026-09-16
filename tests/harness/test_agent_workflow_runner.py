@@ -26,9 +26,10 @@ from pydantic import BaseModel
 from temporalio import workflow
 from temporalio.client import Client, WorkflowHandle, WorkflowUpdateFailedError
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+
+from tests._streams import turn_events, worker_options, workflow_environment
 
 from temporal_agent_harness.harness import AgentWorkflowRunner, agent, slash_commands
 from temporal_agent_harness.harness.agent_protocol import (
@@ -109,7 +110,6 @@ class TypedProbeAgent:
     def __init__(self, config: AgentConfig) -> None:
         self._runner = AgentWorkflowRunner(
             config,
-            stream=WorkflowStream(),
             # Default queuing on (tests send several messages back-to-back); a config
             # value would still win over this default.
             enable_message_queuing_default=True,
@@ -154,7 +154,6 @@ class SlashExtensionProbeAgent:
     def __init__(self, config: AgentConfig) -> None:
         self._runner = AgentWorkflowRunner(
             config,
-            stream=WorkflowStream(),
             approval_policy_default=ToolApprovalPolicy.always_require_approvals(),
             slash_commands=[
                 *slash_commands.default_commands(),
@@ -185,12 +184,13 @@ class SlashExtensionProbeAgent:
 @pytest_asyncio.fixture
 async def client_and_queue():
     """A time-skipping env (pydantic converter) with a worker hosting the probe."""
-    env = await WorkflowEnvironment.start_time_skipping(
+    env = await workflow_environment(
         data_converter=pydantic_data_converter
     )
     task_queue = f"agent-workflow-runner-test-{uuid.uuid4()}"
     async with Worker(
         env.client,
+        **worker_options(),
         task_queue=task_queue,
         workflows=[TypedProbeAgent, SlashExtensionProbeAgent],
         # Unsandboxed so the test module's imports (pydantic, harness, pytest) don't
@@ -458,8 +458,7 @@ async def test_attach_replays_operator_only_history_and_stops(client_and_queue):
     agent_client = AgentClient(client, handle.id)
 
     stream = await agent_client.attach(
-        from_offset=0,
-        on_item=lambda item, _resume_offset: item,
+        on_item=lambda item, _resume: item,
     )
 
     items: list[AgentEvent] = []
@@ -528,21 +527,11 @@ async def test_configured_core_command_preempts_agent_extension(
 
 
 async def _collect_until_turn_end(client: Client, workflow_id: str) -> list[AgentEvent]:
-    from datetime import timedelta
-
-    from temporalio.contrib.workflow_streams import WorkflowStreamClient
-
-    stream = WorkflowStreamClient.create(client, workflow_id)
     events: list[AgentEvent] = []
     async with asyncio.timeout(30):
-        async for item in stream.subscribe(
-            topics=["turn_events"],
-            from_offset=0,
-            result_type=AgentEvent,
-            poll_cooldown=timedelta(milliseconds=10),
-        ):
-            events.append(item.data)
-            if item.data.event.type == AgentEventType.TURN_END:
+        async for envelope in turn_events(client, workflow_id):
+            events.append(envelope)
+            if envelope.event.type == AgentEventType.TURN_END:
                 break
     return events
 
@@ -550,21 +539,11 @@ async def _collect_until_turn_end(client: Client, workflow_id: str) -> list[Agen
 async def _collect_until_operator_terminal(
     client: Client, workflow_id: str
 ) -> list[AgentEvent]:
-    from datetime import timedelta
-
-    from temporalio.contrib.workflow_streams import WorkflowStreamClient
-
-    stream = WorkflowStreamClient.create(client, workflow_id)
     events: list[AgentEvent] = []
     async with asyncio.timeout(30):
-        async for item in stream.subscribe(
-            topics=["turn_events"],
-            from_offset=0,
-            result_type=AgentEvent,
-            poll_cooldown=timedelta(milliseconds=10),
-        ):
-            events.append(item.data)
-            if item.data.event.type in {
+        async for envelope in turn_events(client, workflow_id):
+            events.append(envelope)
+            if envelope.event.type in {
                 AgentEventType.OPERATOR_COMMAND_COMPLETED,
                 AgentEventType.OPERATOR_COMMAND_FAILED,
             }:
@@ -783,22 +762,12 @@ def test_agent_defn_rejects_bespoke_input_at_definition_time():
 # ---------------------------------------------------------------------------
 
 
-def test_stream_and_approval_policy_default_are_required():
-    """``stream`` and ``approval_policy_default`` are required keyword-only constructor
-    args, so omitting either is a call-site TypeError — no runtime ``build()`` check to
-    forget. The author must make a deliberate safe-by-default approval choice."""
-    stream = MagicMock()
-    stream.topic.return_value = MagicMock()
+def test_approval_policy_default_is_required():
+    """``approval_policy_default`` is a required keyword-only constructor arg, so omitting it
+    is a call-site TypeError — no runtime ``build()`` check to forget. The author must make a
+    deliberate safe-by-default approval choice."""
     with pytest.raises(TypeError):
-        AgentWorkflowRunner(  # type: ignore[call-arg]  — missing stream
-            AgentConfig(),
-            approval_policy_default=ToolApprovalPolicy.dangerously_skip_all(),
-        )
-    with pytest.raises(TypeError):
-        AgentWorkflowRunner(  # type: ignore[call-arg]  — missing approval_policy_default
-            AgentConfig(),
-            stream=stream,
-        )
+        AgentWorkflowRunner(AgentConfig())  # type: ignore[call-arg]  — missing approval_policy_default
 
 
 def test_message_queuing_resolves_config_over_agent_default(offline_build):
@@ -980,6 +949,8 @@ def offline_build(monkeypatch):
     # The runner generates its short agent_id from workflow.uuid4() in __init__; offline there is
     # no workflow loop, so stub it with a plain uuid.
     monkeypatch.setattr(aw.workflow, "uuid4", lambda: uuid.uuid4())
+    # Offline there is no provider to bind a writer on; a mock records what the runner publishes.
+    monkeypatch.setattr(aw.streams, "writer", lambda *a, **k: MagicMock())
 
     def build(
         config: AgentConfig,
@@ -987,8 +958,6 @@ def offline_build(monkeypatch):
         default: bool | None = None,
         slash_commands=None,
     ):
-        stream = MagicMock()
-        stream.topic.return_value = MagicMock()
         kwargs: dict[str, Any] = {}
         if default is not None:
             kwargs["enable_message_queuing_default"] = default
@@ -996,7 +965,6 @@ def offline_build(monkeypatch):
             kwargs["slash_commands"] = slash_commands
         return AgentWorkflowRunner(
             config,
-            stream=stream,
             approval_policy_default=ToolApprovalPolicy.dangerously_skip_all(),
             **kwargs,
         )
@@ -1014,13 +982,11 @@ def offline_build_policy(monkeypatch):
     # The runner generates its short agent_id from workflow.uuid4() in __init__; offline there is
     # no workflow loop, so stub it with a plain uuid.
     monkeypatch.setattr(aw.workflow, "uuid4", lambda: uuid.uuid4())
+    monkeypatch.setattr(aw.streams, "writer", lambda *a, **k: MagicMock())
 
     def build(config: AgentConfig, *, default: ToolApprovalPolicy, custom_fallback=None):
-        stream = MagicMock()
-        stream.topic.return_value = MagicMock()
         return AgentWorkflowRunner(
             config,
-            stream=stream,
             approval_policy_default=default,
             custom_approval_fallback=custom_fallback,
         )
