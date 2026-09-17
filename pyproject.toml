@@ -81,6 +81,11 @@ dev = [
     "temporalio[opentelemetry]>=1.30.0",
     # Pydantic AI integration (the ai_sdks glue + its tests) — mirrors the `pydantic-ai` extra.
     "pydantic-ai-slim[temporal]>=2.13",
+    # The two stream providers that need a client of their own. Without these, a fresh dev sync
+    # cannot run STREAMS_PROVIDER=redis (no redis client) or =native, whose stream client imports
+    # grpc and so drops out of the provider registry rather than failing loudly.
+    "redis>=5,<9",
+    "temporalio[grpc]>=1.30.0",
     { include-group = "examples" },
 ]
 
