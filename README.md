@@ -411,6 +411,20 @@ per-process choice made from the environment. Workers, the web app, and the Nexu
 The test suite honours the same variable (`STREAMS_PROVIDER=redis uv run pytest`), and for
 `native` connects to the server `TEMPORAL_ADDRESS` names instead of starting the test server.
 
+What the choice costs, beyond the table:
+
+- `native` needs a server build. The time-skipping test server is a released Temporal, so a
+  workflow that publishes cannot run on it. That is the clearest practical cost of keeping the
+  payload in Temporal, to weigh against not running a second datastore.
+- On `native`, a workflow's own publish rides its Workflow Task and costs nothing extra. A publish
+  from an activity costs one transition on the agent's execution per batch, which is why the
+  activity-side publisher buffers.
+- `native` and `redis` store the framed value as is. It goes through the payload converter, so
+  typed decode works, but not through the codec chain, so nothing encrypts or compresses it.
+
+Not checked yet on `native`: Cassandra, so nothing here says what streams cost on it, and a
+workflow that was terminated rather than completed while a reader was tailing it.
+
 ### One example, standalone
 
 Each example runs on its own from its directory — [`examples/monty`](examples/monty) (a
