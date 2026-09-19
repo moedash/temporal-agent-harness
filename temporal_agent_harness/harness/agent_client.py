@@ -48,7 +48,7 @@ from temporal_agent_harness.harness.stream_merge import (
     select_replay,
 )
 from temporal_agent_harness.harness.stream_merge.cursor import Cursor
-from temporal_agent_harness.harness.stream_transport import latest_turn_event
+from temporal_agent_harness.harness.stream_transport import latest_turn_event, provider_name
 
 # Client default: maximum seconds to wait for a turn to complete.
 DEFAULT_TURN_TIMEOUT = 300.0
@@ -589,8 +589,11 @@ class AgentClient:
         whether anything followed, and asking the provider for one would tie the client to it.
         This lets a replay that ends with out-of-band operator commands drain them without waiting
         for a nonexistent turn.
+
+        A ``resume`` that is malformed, or that was minted under another stream provider, raises
+        ``ValueError`` before any I/O, so a caller can answer with a client error and start over.
         """
-        point = ResumePoint.decode(resume)
+        point = ResumePoint.decode(resume, provider=provider_name())
         status = await self.get_status()
         # Already caught up (the point is at or past the agent's last word) and the agent is
         # idle — nothing to stream.

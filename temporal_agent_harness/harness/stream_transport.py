@@ -19,6 +19,15 @@ PROVIDER_ENV = "STREAMS_PROVIDER"
 DEFAULT_PROVIDER = "workflow_streams"
 
 
+def provider_name() -> str:
+    """The provider this process names, read from ``STREAMS_PROVIDER``.
+
+    A cursor belongs to the provider that minted it, so anything that stores one for a client
+    to hand back stamps it with this name and refuses a token stamped by another.
+    """
+    return os.environ.get(PROVIDER_ENV, DEFAULT_PROVIDER)
+
+
 def configure_from_env() -> str:
     """Name this process's stream provider from ``STREAMS_PROVIDER``.
 
@@ -27,7 +36,7 @@ def configure_from_env() -> str:
     ``memory`` is the in-process reference the conformance tests use. Call it once, before
     building a ``Worker`` or opening a producer or consumer. Returns the name it chose.
     """
-    name = os.environ.get(PROVIDER_ENV, DEFAULT_PROVIDER)
+    name = provider_name()
     options: dict[str, Any] = {}
     if name == "workflow_streams":
         # The shipped transport polls between deliveries; the UI wants deltas within a

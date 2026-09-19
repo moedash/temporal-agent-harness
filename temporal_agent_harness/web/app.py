@@ -45,7 +45,7 @@ from temporal_agent_harness.harness.agent_protocol import (
     SEND_AGENT_MESSAGE_UPDATE,
 )
 from temporal_agent_harness.harness.stream_merge import ResumePoint
-from temporal_agent_harness.harness.stream_transport import configure_from_env
+from temporal_agent_harness.harness.stream_transport import configure_from_env, provider_name
 from temporal_agent_harness.ui import packaged_ui_dist
 from temporal_agent_harness.utils.large_payload import with_large_payload_offload
 from temporal_agent_harness.web.registry import load_agent_registry
@@ -242,11 +242,13 @@ def create_agent_harness_app(
     @app.get("/api/attach")
     async def attach(session_id: str, resume: str = "") -> StreamingResponse:
         client = AgentClient(temporal=app.state.temporal, workflow_id=session_id)
-        return StreamingResponse(
-            await client.attach(on_item=_yield_item, resume=resume),
-            media_type="text/event-stream",
-            headers=_sse_headers(),
-        )
+        try:
+            items = await client.attach(on_item=_yield_item, resume=resume)
+        except ValueError as e:
+            # A stale tab after a provider switch, or a client bug. A 400 tells the UI to
+            # re-attach from the beginning; a 500 would tell it nothing.
+            raise HTTPException(status_code=400, detail=f"invalid resume point: {e}") from e
+        return StreamingResponse(items, media_type="text/event-stream", headers=_sse_headers())
 
     @app.post("/api/approve")
     async def approve_tool(req: ToolApprovalRequestBody):
@@ -627,7 +629,7 @@ def _sse(event: str, data: dict, resume: ResumePoint | None = None) -> bytes:
     payload = {**data}
     if resume is not None:
         # The encoded point a browser hands back to ``/api/attach?resume=`` after a disconnect.
-        payload["resume"] = resume.encode()
+        payload["resume"] = resume.encode(provider=provider_name())
     return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
 
 

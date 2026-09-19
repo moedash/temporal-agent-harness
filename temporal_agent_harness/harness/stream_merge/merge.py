@@ -66,17 +66,39 @@ class ResumePoint:
         """The point just past a root record; an activity-published record keeps the last seq."""
         return ResumePoint(cursor=cursor, seq=self.seq if seq is None else seq)
 
-    def encode(self) -> str:
-        return f"{self.seq}@{self.cursor}" if (self.cursor or self.seq) else ""
+    def encode(self, *, provider: str = "") -> str:
+        """One string for a consumer to store and hand back.
+
+        ``provider`` names the store the cursor belongs to. A point minted under one provider
+        means nothing to another, and stamping it lets ``decode`` refuse the mix-up up front
+        instead of the store choking on a token it cannot parse.
+        """
+        if not (self.cursor or self.seq):
+            return ""
+        prefix = f"{provider}:" if provider else ""
+        return f"{prefix}{self.seq}@{self.cursor}"
 
     @classmethod
-    def decode(cls, text: str) -> ResumePoint:
+    def decode(cls, text: str, *, provider: str = "") -> ResumePoint:
+        """The point ``text`` encodes.
+
+        Raises ``ValueError`` when the text is malformed or stamped with another provider's
+        name. An unstamped point is accepted as is.
+        """
         if not text:
             return cls()
-        seq, sep, cursor = text.partition("@")
+        head, sep, cursor = text.partition("@")
         if not sep:
             raise ValueError(f"not a resume point: {text!r}")
-        return cls(cursor=cursor, seq=int(seq))
+        minted_by, _, seq = head.rpartition(":")
+        if minted_by and minted_by != provider:
+            raise ValueError(
+                f"resume point belongs to the {minted_by!r} stream provider, not {provider!r}"
+            )
+        try:
+            return cls(cursor=cursor, seq=int(seq))
+        except ValueError:
+            raise ValueError(f"not a resume point: {text!r}") from None
 
 
 # What the merge yields per step: the event plus the **resume point**, a ROOT-stream position

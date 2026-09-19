@@ -845,6 +845,29 @@ async def test_resume_point_advances_past_each_root_event():
     assert [p.cursor for p in points] == [str(i) for i in range(9)]
 
 
+def test_resume_point_round_trips_with_its_provider():
+    point = ResumePoint(cursor="7", seq=3)
+    text = point.encode(provider="redis")
+    assert text == "redis:3@7"
+    assert ResumePoint.decode(text, provider="redis") == point
+    # An unstamped point is still accepted, and the beginning encodes to nothing at all.
+    assert ResumePoint.decode("3@7", provider="redis") == point
+    assert ResumePoint().encode(provider="redis") == ""
+    assert ResumePoint.decode("", provider="redis") == ResumePoint()
+
+
+def test_resume_point_from_another_provider_is_rejected():
+    text = ResumePoint(cursor="7", seq=3).encode(provider="native")
+    with pytest.raises(ValueError, match="native"):
+        ResumePoint.decode(text, provider="redis")
+
+
+@pytest.mark.parametrize("text", ["7", "x@7", "redis:x@7", "@"])
+def test_malformed_resume_point_is_rejected(text):
+    with pytest.raises(ValueError):
+        ResumePoint.decode(text, provider="redis")
+
+
 async def test_resume_from_offset_streams_only_events_after_it():
     # Resuming from offset 3 (start of turn 2) yields turns 2 and 3 — turn 1 is not re-sent. No
     # skip: the root simply starts at offset 3, which is turn 2's turn_started.
