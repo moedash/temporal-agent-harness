@@ -92,6 +92,9 @@ class ActivityPublisher:
         self._pending: list[Any] = []
         self._task: asyncio.Task[None] | None = None
         self._closed = False
+        # Closing wakes the flusher rather than cancelling it: a cancel landing inside an
+        # append would unwind ``flush`` with the batch it had already taken off ``_pending``.
+        self._wake = asyncio.Event()
 
     def publish(self, value: Any) -> None:
         if self._closed:
@@ -105,7 +108,10 @@ class ActivityPublisher:
 
     async def _run(self) -> None:
         while not self._closed:
-            await asyncio.sleep(self._interval)
+            try:
+                await asyncio.wait_for(self._wake.wait(), self._interval)
+            except TimeoutError:
+                pass
             await self.flush()
 
     async def __aenter__(self) -> ActivityPublisher:
@@ -114,12 +120,9 @@ class ActivityPublisher:
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         self._closed = True
+        self._wake.set()
         if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+            await self._task
         # The tail goes out even when the activity is failing, so a reader sees what was
         # produced up to the failure.
         await self.flush()
