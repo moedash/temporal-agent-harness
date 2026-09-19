@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
@@ -51,6 +51,7 @@ from temporal_agent_harness.harness.agent_protocol import (
     TextMessage,
     TextReply,
     ToolApprovalPolicy,
+    TurnEnded,
     AgentMessageReply,
     SlashCommand,
 )
@@ -805,7 +806,7 @@ def test_approval_policy_resolves_config_over_agent_default(offline_build_policy
     )
 
 
-def test_set_approval_policy_resolves_matching_pending(offline_build_policy):
+async def test_set_approval_policy_resolves_matching_pending(offline_build_policy):
     from temporal_agent_harness.harness.agent_workflow import _ApprovalStatus
 
     runner = offline_build_policy(
@@ -819,6 +820,7 @@ def test_set_approval_policy_resolves_matching_pending(offline_build_policy):
     )
 
     runner.set_approval_policy(ToolApprovalPolicy.allow_tools(["trusted_tool"]))
+    await runner._settle_outbox()
 
     assert runner._status.is_approval_resolved("t1") is True
     entry = runner._status.approval_entry("t1")
@@ -884,7 +886,7 @@ def test_protocol_types_use_concrete_annotations():
             )
 
 
-def test_errored_subagent_turn_closes_bracket_on_actual_accepted_turn(offline_build):
+async def test_errored_subagent_turn_closes_bracket_on_actual_accepted_turn(offline_build):
     """On an accepted-but-errored child turn, the parent closes the
     [subagent_message_sent … subagent_reply_received] bracket on the child's ACTUAL accepted turn
     number — which the activity threads through the error details — not a re-derived ``expected``.
@@ -914,8 +916,9 @@ def test_errored_subagent_turn_closes_bracket_on_actual_accepted_turn(offline_bu
     runner._publish_subagent_reply_received(
         inst, "run_script", accepted, outcome="error"
     )
+    await runner._settle_outbox()
 
-    published = [c.args[0] for c in runner._events.publish.call_args_list]
+    published = [c.args[0] for c in runner._events.publish.await_args_list]
     replies = [e for e in published if isinstance(e.event, SubagentReplyReceived)]
     assert len(replies) == 1
     rr = replies[0].event
@@ -925,6 +928,44 @@ def test_errored_subagent_turn_closes_bracket_on_actual_accepted_turn(offline_bu
     assert rr.subagent_id == "aaaaaa-bbbbbb"
     # The local turn counter advances off the same accepted turn.
     assert accepted + 1 == 8
+
+
+async def test_offline_publish_reaches_the_writer_in_order(offline_build):
+    """A runner built outside a workflow drains its outbox on the running loop, so what it
+    publishes is awaited on the writer in the order it was queued."""
+    runner = offline_build(AgentConfig())
+    runner._pub("turn-1", 1, TurnEnded())
+    runner._pub("turn-2", 2, TurnEnded())
+    await runner._settle_outbox()
+
+    turns = [c.args[0].turn_id for c in runner._events.publish.await_args_list]
+    assert turns == ["turn-1", "turn-2"]
+    assert runner._outbox == []
+
+
+async def test_refused_publish_stays_queued_and_fails_the_settle(offline_build):
+    """A publish the provider refuses is not lost: the envelope stays at the head of the
+    outbox and the failure surfaces where the run loop settles the outbox."""
+    runner = offline_build(AgentConfig())
+    runner._events.publish.side_effect = [None, RuntimeError("store refused it")]
+    runner._pub("turn-1", 1, TurnEnded())
+    runner._pub("turn-2", 2, TurnEnded())
+
+    with pytest.raises(RuntimeError, match="store refused it"):
+        await runner._settle_outbox()
+    assert [e.turn_id for e in runner._outbox] == ["turn-2"]
+
+    # Nothing queued afterwards starts a drain that would bury the failure.
+    runner._pub("turn-3", 3, TurnEnded())
+    with pytest.raises(RuntimeError, match="store refused it"):
+        await runner._settle_outbox()
+    assert [e.turn_id for e in runner._outbox] == ["turn-2", "turn-3"]
+
+
+def test_publish_without_a_running_loop_is_refused(offline_build):
+    runner = offline_build(AgentConfig())
+    with pytest.raises(RuntimeError, match="running event loop"):
+        runner._pub("turn-1", 1, TurnEnded())
 
 
 def test_accepted_turn_from_error_falls_back_when_detail_absent():
@@ -950,7 +991,9 @@ def offline_build(monkeypatch):
     # no workflow loop, so stub it with a plain uuid.
     monkeypatch.setattr(aw.workflow, "uuid4", lambda: uuid.uuid4())
     # Offline there is no provider to bind a writer on; a mock records what the runner publishes.
-    monkeypatch.setattr(aw.streams, "writer", lambda *a, **k: MagicMock())
+    # Its publish is awaitable like the real one, so a publish that was only called and never
+    # awaited shows up as a missing await rather than passing by accident.
+    monkeypatch.setattr(aw.streams, "writer", lambda *a, **k: MagicMock(publish=AsyncMock()))
 
     def build(
         config: AgentConfig,
@@ -982,7 +1025,7 @@ def offline_build_policy(monkeypatch):
     # The runner generates its short agent_id from workflow.uuid4() in __init__; offline there is
     # no workflow loop, so stub it with a plain uuid.
     monkeypatch.setattr(aw.workflow, "uuid4", lambda: uuid.uuid4())
-    monkeypatch.setattr(aw.streams, "writer", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(aw.streams, "writer", lambda *a, **k: MagicMock(publish=AsyncMock()))
 
     def build(config: AgentConfig, *, default: ToolApprovalPolicy, custom_fallback=None):
         return AgentWorkflowRunner(

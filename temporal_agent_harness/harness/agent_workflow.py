@@ -1297,7 +1297,7 @@ class AgentWorkflowRunner:
         self._events = streams.writer(TURN_EVENTS_TOPIC, type=AgentEvent)
         # Envelopes queued by ``_pub`` and drained in order by one task; see ``_pub``.
         self._outbox: list[AgentEvent] = []
-        self._flush_task: asyncio.Future[None] | None = None
+        self._flush_task: asyncio.Task[None] | None = None
         self._custom_approval_fallback = custom_approval_fallback
         self._status = _WorkflowStatus(
             agent_id=self._agent_id,
@@ -1955,10 +1955,11 @@ class AgentWorkflowRunner:
                 # end-of-turn signal) before looping back to wait for the next message.
                 self._status.complete_turn()
                 self._pub(turn_id, turn_number, TurnEnded())
+                await self._settle_outbox()
         # Whatever is still queued goes out with this task. Then the provider lets go of what
         # it parked against this run (the shipped transport holds an outside reader's long
         # poll here), so the workflow can return without stranding a handler.
-        await self._flush_outbox()
+        await self._settle_outbox()
         streams.drain()
         await workflow.wait_condition(workflow.all_handlers_finished)
 
@@ -2353,7 +2354,7 @@ class AgentWorkflowRunner:
     # -- Internal -----------------------------------------------------------
 
     def _pub(self, turn_id: str, turn_number: int, event: AgentStreamItem) -> None:
-        """Wrap ``event`` in an :class:`AgentEvent` envelope and publish it."""
+        """Wrap ``event`` in an :class:`AgentEvent` envelope and queue it for publishing."""
         envelope = AgentEvent(
             event=event,
             # This agent's own short id — so every event on the stream self-identifies its
@@ -2365,21 +2366,42 @@ class AgentWorkflowRunner:
             timestamp=workflow.time(),
             seq=self._status.next_event_seq(),
         )
-        if not workflow.in_workflow():
-            # Built offline (a unit test constructs a runner with no workflow around it): there
-            # is no task to commit with, so the envelope goes straight to the writer.
-            self._events.publish(envelope)
-            return
         # The writer's publish awaits its provider (one of them applies back pressure) while
         # most publish sites here are synchronous, so envelopes queue and one task drains them
-        # in the order they were queued.
+        # in the order they were queued. A drain that failed is left in place: its exception
+        # belongs to whoever settles the outbox next, and a fresh drain would discard it.
         self._outbox.append(envelope)
-        if self._flush_task is None or self._flush_task.done():
-            self._flush_task = asyncio.ensure_future(self._flush_outbox())
+        task = self._flush_task
+        if task is None or (task.done() and not task.cancelled() and task.exception() is None):
+            self._flush_task = self._start_drain()
+
+    def _start_drain(self) -> asyncio.Task[None]:
+        # The workflow sandbox installs its own loop as the running one, so the same call
+        # serves a workflow and a runner built offline in an async test.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            raise RuntimeError("publishing needs a running event loop") from None
+        return loop.create_task(self._flush_outbox())
 
     async def _flush_outbox(self) -> None:
+        # Pop only after the publish returned, so an envelope the provider refused stays at the
+        # head rather than vanishing with the exception.
         while self._outbox:
-            await self._events.publish(self._outbox.pop(0))
+            await self._events.publish(self._outbox[0])
+            self._outbox.pop(0)
+
+    async def _settle_outbox(self) -> None:
+        """Wait until the drain has published everything queued.
+
+        The drain runs as its own task, so a publish that raised would otherwise die with it
+        unnoticed. Awaiting it here fails the workflow task instead, and a caller sees the
+        refused envelope still at the head of the outbox.
+        """
+        while self._flush_task is not None and not self._flush_task.done():
+            await self._flush_task
+        if self._flush_task is not None:
+            self._flush_task.result()
 
 
 # ---------------------------------------------------------------------------
