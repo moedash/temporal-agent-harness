@@ -168,7 +168,7 @@ func TestDecodeTurnEvent_RoundTrip(t *testing.T) {
 		Timestamp:  1700000000.0,
 		Event:      turnEvent{Type: "reply_delta", Text: "hello"},
 	}
-	item := makeTestStreamItem(t, si, 0, turnEventsTopic)
+	item := makeTestStreamItem(t, si, "0", turnEventsTopic)
 
 	turnNumber, got, err := decodeTurnEvent(item)
 	require.NoError(t, err)
@@ -188,7 +188,7 @@ func runStartTurnWorkflow(ctx workflow.Context, input router.Input) (router.Star
 
 type pollTurnWorkflowInput struct {
 	Handle router.TurnHandle
-	Cursor int64
+	Cursor string
 }
 
 func runPollTurnWorkflow(ctx workflow.Context, in pollTurnWorkflowInput) (router.PollResult, error) {
@@ -212,7 +212,7 @@ func TestStartTurn_Message_ReturnsHandleFromSendAgentMessage(t *testing.T) {
 		harnessgen.AgentService.SendAgentMessage.Name(),
 		func(ctx context.Context, input harnessgen.SendAgentMessageInput, opts nexus.StartOperationOptions) (harnessgen.SendMessageOutput, error) {
 			assert.Equal(t, "ask", input.MsgType)
-			return harnessgen.SendMessageOutput{TurnNumber: 2, StreamHeadOffset: ptr(int64(5))}, nil
+			return harnessgen.SendMessageOutput{TurnNumber: 2}, nil
 		},
 	))
 
@@ -228,7 +228,6 @@ func TestStartTurn_Message_ReturnsHandleFromSendAgentMessage(t *testing.T) {
 	require.NoError(t, env.GetWorkflowResult(&result))
 	require.NotNil(t, result.Handle)
 	assert.Equal(t, int64(2), result.Handle.TurnNumber)
-	assert.Equal(t, int64(5), result.Handle.StreamHeadOffset)
 	assert.Equal(t, "slack:C1", result.Handle.SessionID)
 }
 
@@ -301,8 +300,8 @@ func TestStartTurn_Approval_CallsApproveToolCall(t *testing.T) {
 	svc.MustRegister(nexus.NewSyncOperation(
 		harnessgen.AgentService.ApproveToolCall.Name(),
 		func(ctx context.Context, input harnessgen.ApproveToolCallInput, opts nexus.StartOperationOptions) (harnessgen.ApproveToolCallOutput, error) {
-			gotToolID, gotApproved = input.ToolId, input.Approved
-			return harnessgen.ApproveToolCallOutput{Accepted: true, ToolId: input.ToolId}, nil
+			gotToolID, gotApproved = input.ToolID, input.Approved
+			return harnessgen.ApproveToolCallOutput{Accepted: true, ToolID: input.ToolID}, nil
 		},
 	))
 
@@ -323,34 +322,34 @@ func TestStartTurn_Approval_CallsApproveToolCall(t *testing.T) {
 
 func TestPollTurn_StartsFromCursorAndSkipsStaleEvents(t *testing.T) {
 	items := []harnessgen.StreamItem{
-		makeTestStreamItem(t, streamItem{TurnID: "old", TurnNumber: 1, Event: turnEvent{Type: "reply_delta", Text: "stale"}}, 0, turnEventsTopic),
-		makeTestStreamItem(t, streamItem{TurnID: "t2", TurnNumber: 2, Event: turnEvent{Type: "reply_delta", Text: "fresh"}}, 1, turnEventsTopic),
+		makeTestStreamItem(t, streamItem{TurnID: "old", TurnNumber: 1, Event: turnEvent{Type: "reply_delta", Text: "stale"}}, "0", turnEventsTopic),
+		makeTestStreamItem(t, streamItem{TurnID: "t2", TurnNumber: 2, Event: turnEvent{Type: "reply_delta", Text: "fresh"}}, "1", turnEventsTopic),
 	}
 
 	svc := nexus.NewService(harnessgen.AgentService.ServiceName)
-	var gotCursor int64
+	var gotCursor string
 	svc.MustRegister(nexus.NewSyncOperation(
 		harnessgen.AgentService.PollMessages.Name(),
 		func(ctx context.Context, input harnessgen.PollMessagesInput, opts nexus.StartOperationOptions) (harnessgen.PollMessagesOutput, error) {
 			gotCursor = input.Cursor
-			return harnessgen.PollMessagesOutput{Items: items, NextOffset: 2}, nil
+			return harnessgen.PollMessagesOutput{Items: items, NextOffset: "2"}, nil
 		},
 	))
 
 	env := newTestEnv(t, svc)
 	env.ExecuteWorkflow(runPollTurnWorkflow, pollTurnWorkflowInput{
 		Handle: router.TurnHandle{SessionID: "slack:C1", TurnNumber: 2},
-		Cursor: 5,
+		Cursor: "5",
 	})
 
 	require.True(t, env.IsWorkflowCompleted())
 	require.NoError(t, env.GetWorkflowError())
 	var result router.PollResult
 	require.NoError(t, env.GetWorkflowResult(&result))
-	assert.Equal(t, int64(5), gotCursor, "PollTurn must start from the given cursor")
+	assert.Equal(t, "5", gotCursor, "PollTurn must start from the given cursor")
 	require.Len(t, result.Deltas, 1, "the stale turn-1 event must be dropped")
 	assert.Equal(t, "fresh", result.Deltas[0].Text)
-	assert.Equal(t, int64(2), result.NextCursor)
+	assert.Equal(t, "2", result.NextCursor)
 	assert.False(t, result.Closed)
 }
 
@@ -358,13 +357,13 @@ func TestPollTurn_ToolApprovalRequested_ProducesApprovalDelta(t *testing.T) {
 	items := []harnessgen.StreamItem{
 		makeTestStreamItem(t, streamItem{TurnID: "t1", TurnNumber: 1, Event: turnEvent{
 			Type: "tool_approval_requested", ToolID: "t1", ToolName: "search",
-		}}, 0, turnEventsTopic),
+		}}, "0", turnEventsTopic),
 	}
 	svc := nexus.NewService(harnessgen.AgentService.ServiceName)
 	svc.MustRegister(nexus.NewSyncOperation(
 		harnessgen.AgentService.PollMessages.Name(),
 		func(ctx context.Context, input harnessgen.PollMessagesInput, opts nexus.StartOperationOptions) (harnessgen.PollMessagesOutput, error) {
-			return harnessgen.PollMessagesOutput{Items: items, NextOffset: 1}, nil
+			return harnessgen.PollMessagesOutput{Items: items, NextOffset: "1"}, nil
 		},
 	))
 
@@ -394,7 +393,7 @@ func TestPollTurn_Closed(t *testing.T) {
 	env := newTestEnv(t, svc)
 	env.ExecuteWorkflow(runPollTurnWorkflow, pollTurnWorkflowInput{
 		Handle: router.TurnHandle{SessionID: "slack:C1"},
-		Cursor: 3,
+		Cursor: "3",
 	})
 
 	require.True(t, env.IsWorkflowCompleted())
@@ -402,14 +401,14 @@ func TestPollTurn_Closed(t *testing.T) {
 	var result router.PollResult
 	require.NoError(t, env.GetWorkflowResult(&result))
 	assert.True(t, result.Closed)
-	assert.Equal(t, int64(3), result.NextCursor)
+	assert.Equal(t, "3", result.NextCursor)
 }
 
 // -- Test helpers ------------------------------------------------------------
 
 // makeTestStreamItem encodes a streamItem into the wire format expected by decodeTurnEvent:
 // base64(proto.Marshal(Payload{encoding:"json/plain", data:<json>}))
-func makeTestStreamItem(t *testing.T, si streamItem, offset int64, topic string) harnessgen.StreamItem {
+func makeTestStreamItem(t *testing.T, si streamItem, offset string, topic string) harnessgen.StreamItem {
 	t.Helper()
 	data, err := json.Marshal(si)
 	require.NoError(t, err)

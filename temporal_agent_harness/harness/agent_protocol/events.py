@@ -683,15 +683,16 @@ class SubagentMessageSent(StreamEvent[Literal[AgentEventType.SUBAGENT_MESSAGE_SE
         "Several dispatches in one parent turn share that envelope turn_number but get distinct "
         "subagent_turn values; pairs with the turn_number on the subagent's OWN stream events."
     )
-    from_offset: int = Field(
-        default=0,
-        description="The offset in the SUBAGENT's OWN stream at which this turn's events begin "
-        "(the child stream position the parent resumes consumption from for this turn). A client "
-        "merging the parent + subagent streams positions the child cursor here the first time it "
-        "mounts the child — so a merge that starts mid-session (resuming at a parent turn that is "
-        "not the child's first) skips the child's pre-resume history, whose own message_sent "
-        "markers are not on the merged stream and could otherwise never be ordered. Unrelated "
-        "address space from the parent stream's offsets.",
+    after_cursor: str = Field(
+        default="",
+        description="The cursor on the SUBAGENT's OWN stream that this turn's events follow "
+        "(the child position the parent resumed consumption after for this turn; empty means "
+        "the beginning). A client merging the parent + subagent streams positions the child "
+        "cursor here the first time it mounts the child — so a merge that starts mid-session "
+        "(resuming at a parent turn that is not the child's first) skips the child's pre-resume "
+        "history, whose own message_sent markers are not on the merged stream and could "
+        "otherwise never be ordered. An opaque provider token, unrelated to the parent "
+        "stream's cursors.",
     )
 
 
@@ -889,6 +890,14 @@ class AgentEvent(BaseModel):
     )
     timestamp: float = Field(
         description="When the harness published this envelope (epoch seconds)."
+    )
+    seq: int | None = Field(
+        default=None,
+        description="The publishing agent's own count of the events it has published from "
+        "workflow code, starting at 1, or None for an event an activity published on the "
+        "agent's behalf. A client uses it with ``AgentStatus.last_event_seq`` to know when it "
+        "has caught up with everything the agent has said, which a stream position cannot tell "
+        "it because positions belong to the stream provider.",
     )
     event: AgentStreamItem = Field(
         description="The wrapped stream-event payload — a discriminated union over ``type`` that "

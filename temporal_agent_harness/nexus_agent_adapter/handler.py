@@ -1,20 +1,19 @@
 # ABOUTME: Python implementation of the AgentService Nexus handler.
 #
-# Replaces a Go handler (see git history) that only existed because pollMessages needs
-# update-with-callback, unsupported in Python until sdk-python#1631. All operations except
-# pollMessages just delegate to AgentClient (see _agent_client).
+# All operations except pollMessages delegate to AgentClient (see _agent_client). pollMessages
+# reads the agent's turn events through the stream interface, so the store behind the agent is
+# the worker's choice and this handler does not know which one it is.
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from dataclasses import dataclass
 
 from nexusrpc import HandlerError, HandlerErrorType
 from nexusrpc.handler import StartOperationContext, service_handler, sync_operation
-from temporalio import nexus
-from temporalio.client import Client
-from temporalio.contrib.workflow_streams import PollInput, PollResult
+from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.service import RPCError
 
 from temporal_agent_harness.harness.agent_client import (
@@ -32,6 +31,7 @@ from temporal_agent_harness.harness.agent_protocol import (
     SubagentInfo,
     ToolApprovalPolicy,
 )
+from temporal_agent_harness.harness.stream_transport import follow_turn_events
 
 # Aliased with a Nexus* prefix where the name collides with an agent_protocol type of the
 # same name but a different (reshaped, wire-friendly) shape.
@@ -62,10 +62,14 @@ from .generated import (
 )
 from .generated import AgentService as AgentServiceDefinition
 
-# WorkflowStream's private poll-update name (not part of its public API), hardcoded since
-# pollMessages must attach to it for any agent without importing that agent's workflow code.
-_WORKFLOW_STREAM_POLL_UPDATE = "__temporal_workflow_stream_poll"
 DEFAULT_POLL_TIMEOUT_SECONDS = 30.0
+# pollMessages is a synchronous Nexus operation, so one call has to answer well inside the
+# operation's own deadline; a caller wanting to wait longer polls again.
+MAX_POLL_SECONDS = 8.0
+POLL_BATCH_LIMIT = 100
+# Once one event has arrived, gather what follows it within this window and answer, rather than
+# holding the batch open for the whole timeout.
+POLL_BATCH_GRACE_SECONDS = 0.05
 _MAX_SEND_RETRIES = 5
 
 
@@ -201,7 +205,6 @@ class AgentServiceHandler:
             return SendMessageOutput(
                 turn_number=reply.turn_number,
                 turn_id=reply.turn_id,
-                stream_head_offset=reply.accepted_offset,
                 pending=reply.pending,
             )
         raise HandlerError(
@@ -329,49 +332,66 @@ class AgentServiceHandler:
         )
 
     # -----------------------------------------------------------------------
-    # pollMessages — async operation backed by WorkflowStream's poll update
+    # pollMessages — one batch of turn events after a cursor, through the stream interface
     # -----------------------------------------------------------------------
 
-    @nexus.temporal_operation
+    @sync_operation
     async def poll_messages(
-        self,
-        ctx: nexus.TemporalStartOperationContext,
-        client: nexus.TemporalNexusClient,
-        input: PollMessagesInput,
-    ) -> nexus.TemporalOperationResult[PollMessagesOutput]:
-        """Long-polls WorkflowStream via update-with-callback. Returns closed=True
-        synchronously if the target workflow has already completed."""
+        self, ctx: StartOperationContext, input: PollMessagesInput
+    ) -> PollMessagesOutput:
+        """Wait up to the poll timeout for turn events after ``input.cursor`` and return them.
+
+        ``cursor`` is the opaque token of the last item the caller handled (empty for the
+        beginning); ``next_offset`` is the token to hand back next time. ``closed`` is set when
+        the agent workflow has completed, which is when a stream that lives with the workflow
+        ends; on a store that outlives it, the caller learns the same from the agent's status.
+        """
         workflow_id = self._workflow_id(input.session_id)
-        timeout_seconds = input.timeout_seconds or DEFAULT_POLL_TIMEOUT_SECONDS
-
+        timeout = min(input.timeout_seconds or DEFAULT_POLL_TIMEOUT_SECONDS, MAX_POLL_SECONDS)
+        converter = self._client.data_converter.payload_converter
+        items: list[StreamItem] = []
+        cursor = input.cursor
+        closed = False
+        more_ready = False
+        events = follow_turn_events(self._client, workflow_id, after=cursor)
         try:
-            result = await client.start_workflow_update(
-                workflow_id,
-                _WORKFLOW_STREAM_POLL_UPDATE,
-                PollInput(from_offset=input.cursor, topics=[TURN_EVENTS_TOPIC]),
-                result_type=PollResult,
-            )
-        except RPCError as e:
-            if _is_workflow_already_completed(e):
-                return nexus.TemporalOperationResult.sync(
-                    PollMessagesOutput(
-                        items=[], more_ready=False, next_offset=input.cursor, closed=True
+            async with asyncio.timeout(timeout) as window:
+                async for record in events:
+                    payload = converter.to_payloads([record.value])[0]
+                    items.append(
+                        StreamItem(
+                            topic=TURN_EVENTS_TOPIC,
+                            data=base64.b64encode(payload.SerializeToString()).decode("ascii"),
+                            offset=record.cursor.token,
+                        )
                     )
-                )
-            raise
+                    cursor = record.cursor.token
+                    if len(items) >= POLL_BATCH_LIMIT:
+                        more_ready = True
+                        break
+                    window.reschedule(
+                        asyncio.get_running_loop().time() + POLL_BATCH_GRACE_SECONDS
+                    )
+                else:
+                    # The subscription ended on its own. The shipped transport ends it when the
+                    # workflow completes, but a transport may also end it quietly on the deadline,
+                    # so the workflow itself is asked rather than the subscription trusted.
+                    closed = await self._workflow_completed(workflow_id)
+        except TimeoutError:
+            pass
+        except RPCError as e:
+            if not _is_workflow_already_completed(e):
+                raise
+            closed = True
+        finally:
+            await events.aclose()
+        return PollMessagesOutput(
+            items=items, more_ready=more_ready, next_offset=cursor, closed=closed
+        )
 
-        if result.token is not None:
-            return nexus.TemporalOperationResult.async_token(result.token)
-
-        poll_result: PollResult = result.value
-        return nexus.TemporalOperationResult.sync(
-            PollMessagesOutput(
-                items=[
-                    StreamItem(topic=item.topic, data=item.data, offset=item.offset)
-                    for item in poll_result.items
-                ],
-                more_ready=poll_result.more_ready,
-                next_offset=poll_result.next_offset,
-                closed=False,
-            )
+    async def _workflow_completed(self, workflow_id: str) -> bool:
+        description = await self._client.get_workflow_handle(workflow_id).describe()
+        return (
+            description.status is not None
+            and description.status != WorkflowExecutionStatus.RUNNING
         )

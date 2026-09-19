@@ -37,6 +37,8 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.envconfig import ClientConfig
 from temporalio.worker import Worker
 
+from temporal_agent_harness.harness.stream_transport import configure_from_env, worker_options
+
 from temporal_agent_harness.harness.code_mode.activities import CODE_MODE_ACTIVITIES
 from temporal_agent_harness.harness.subagent_activities import SubagentActivities
 
@@ -93,8 +95,10 @@ async def main() -> None:
     # send updates to + stream the reply from the child MontyDynamicAgent workflow. It's the
     # activity the subagent toolset's monty_run_script tool dispatches each turn.
     subagents = SubagentActivities(client)
+    configure_from_env()
     worker = Worker(
         client,
+        **worker_options(),
         task_queue=task_queue,
         workflows=[
             MontyDynamicAgentWorkflow,

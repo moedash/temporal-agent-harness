@@ -399,10 +399,11 @@ class PollMessagesInput(pydantic.BaseModel):
     session_id: str = pydantic.Field(alias="sessionId")
     """Provider-prefixed session identifier"""
 
-    cursor: SpecInt = pydantic.Field()
+    cursor: str = pydantic.Field()
+    """Opaque token of the last item the caller handled; empty for the beginning"""
 
     timeout_seconds: float | None = pydantic.Field(default=None, alias="timeoutSeconds")
-    """How long the WorkflowStream poll update waits for new events before returning empty"""
+    """How long the poll waits for new events before returning empty"""
 
     _OPTIONAL_NON_NULLABLE_FIELDS: typing.ClassVar[frozenset[str]] = frozenset({"timeoutSeconds", "timeout_seconds"})
 
@@ -424,16 +425,14 @@ class PollMessagesInput(pydantic.BaseModel):
 
 
 class PollMessagesOutput(pydantic.BaseModel):
-    """Mirrors WorkflowStream PollResult wire format so the async update-with-callback
-    payload decodes correctly without transformation.
-    """
+    """One batch of turn events after the caller's cursor."""
     model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(strict=True, populate_by_name=True, extra="forbid")
 
     items: list[StreamItem] = pydantic.Field()
-    """Stream events since cursor; decode each as TurnEvent and map to Slack output"""
+    """Stream events after cursor; decode each as TurnEvent and map to Slack output"""
 
-    next_offset: SpecInt = pydantic.Field()
-    """Next cursor value to use in the following pollMessages call"""
+    next_offset: str = pydantic.Field()
+    """Opaque cursor to use in the following pollMessages call"""
 
     more_ready: bool = pydantic.Field()
     """True when more items are immediately available (batch was capped)"""
@@ -578,17 +577,12 @@ class SendMessageOutput(pydantic.BaseModel):
     turn_id: str = pydantic.Field(alias="turnId")
     """Unique ID for this turn"""
 
-    stream_head_offset: SpecInt | None = pydantic.Field(default=None, alias="streamHeadOffset")
-    """Stream log offset at message-accept time; start the first pollMessages call from
-    this offset to skip prior-turn history
-    """
-
     pending: bool | None = pydantic.Field(default=None)
     """True if the message was queued behind an active turn rather than dispatched
     immediately
     """
 
-    _OPTIONAL_NON_NULLABLE_FIELDS: typing.ClassVar[frozenset[str]] = frozenset({"pending", "streamHeadOffset", "stream_head_offset"})
+    _OPTIONAL_NON_NULLABLE_FIELDS: typing.ClassVar[frozenset[str]] = frozenset({"pending"})
 
     @pydantic.model_validator(mode="wrap")
     @classmethod
@@ -608,9 +602,7 @@ class SendMessageOutput(pydantic.BaseModel):
 
 
 class StreamItem(pydantic.BaseModel):
-    """One event from WorkflowStream._log. Data is base64(proto
-    Payload{encoding:json/plain, data:TurnEvent JSON}).
-    """
+    """One turn event. Data is base64(proto Payload{encoding:json/plain, data:TurnEvent JSON})."""
     model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(strict=True, populate_by_name=True, extra="forbid")
 
     topic: str = pydantic.Field()
@@ -619,8 +611,8 @@ class StreamItem(pydantic.BaseModel):
     data: str = pydantic.Field()
     """base64-encoded proto Payload containing a TurnEvent"""
 
-    offset: SpecInt = pydantic.Field()
-    """Absolute position of this item in the stream"""
+    offset: str = pydantic.Field()
+    """Opaque cursor of this item; the stream provider's own token"""
 
     @pydantic.model_serializer(mode="wrap")
     def _serialize(

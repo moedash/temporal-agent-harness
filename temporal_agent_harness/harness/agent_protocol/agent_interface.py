@@ -334,19 +334,14 @@ class AgentMessageReply:
     ``pending`` is True if the message was queued behind an active
     turn rather than being processed immediately.
 
-    ``accepted_offset`` is the agent's stream offset captured at the instant the update was
-    accepted (the log head BEFORE this turn publishes anything). It is internal plumbing for the
-    client's stream-merge: a caller starts reading the merged logical stream from here and
-    discards events until this turn's ``turn_started`` — a quiescent point with no in-flight
-    subagent brackets. It is a read-start *hint* (its only requirement is to be ``<=`` this
-    turn's ``turn_started`` offset, which capture-at-acceptance guarantees); the BFF/UI never
-    sees or stores it. For a queued message it is the head mid the active prior turn; the
-    skip-to-``turn_started`` preamble normalizes that.
+    The reply carries no stream position. A workflow does not see where its records land
+    (the provider assigns positions when the task commits), so a client that wants to follow
+    the turn it just started reads the stream's latest position itself before sending and
+    skips to this turn's ``turn_started`` from there.
     """
 
     turn_number: int
     turn_id: str
-    accepted_offset: int = 0
     pending: bool = False
 
 
@@ -507,6 +502,11 @@ class AgentStatus:
     agent_id: str = ""
     current_turn: int = 0
     turn_active: bool = False
+    # The agent's own count of events published from workflow code (see ``AgentEvent.seq``).
+    # A consumer that has emitted the event carrying this number, while the agent is idle, has
+    # caught up; it is the one position the workflow can report, because it counts its own
+    # records rather than asking the stream provider where they landed.
+    last_event_seq: int = 0
     pending_turns: list[PendingTurn] = field(default_factory=list)
     is_message_queuing_enabled: bool = False
     pending_approvals: list[PendingApproval] = field(default_factory=list)

@@ -24,8 +24,8 @@
 # a parent's. Collecting multiple agents' streams for a UI is a future client concern.
 #
 # DESIGN — Temporal Client: the activity needs a ``Client`` to talk to
-# the *child* (both the ``send_agent_message`` update and the stream subscribe). It can't use
-# ``WorkflowStreamClient.from_within_activity()`` (that targets the activity's own parent).
+# the *child* (both the ``send_agent_message`` update and the stream consumer). The activity's
+# own producer targets its parent, not the child, so it cannot serve here.
 # So this is a CLASS that closes over the worker's client; register the bound method as the
 # activity (``activities=[SubagentActivities(client).run_subagent_turn]``). A future harness
 # worker plugin will instantiate it from the worker's client automatically.
@@ -41,7 +41,6 @@ from typing import Any
 from pydantic import BaseModel
 from temporalio import activity
 from temporalio.client import Client, WorkflowUpdateFailedError
-from temporalio.contrib.workflow_streams import WorkflowStreamClient
 from temporalio.exceptions import ApplicationError
 
 from temporal_agent_harness.harness.agent_client import (
@@ -60,22 +59,23 @@ from temporal_agent_harness.harness.agent_protocol import (
     SubagentTurnResult,
 )
 from temporal_agent_harness.harness.agent_workflow import AgentWorkflowRunner
+from temporal_agent_harness.harness.stream_transport import follow_turn_events
 
 
 class _TurnProgress(BaseModel):
     """The activity's heartbeat memo — what a retry needs to resume without re-sending.
 
     Recorded once the message has been sent (``sent`` is always True when present), carrying
-    the child's accepted ``turn_id`` / ``turn_number`` and the next stream ``consumed_offset``
-    to resume from. Its presence in ``heartbeat_details`` is the "already sent?" signal; the
+    the child's accepted ``turn_id`` / ``turn_number`` and the child stream ``consumed_cursor``
+    to resume after. Its presence in ``heartbeat_details`` is the "already sent?" signal; the
     background heartbeat task re-sends THIS object every interval, so the memo stays current as
-    ``consumed_offset`` advances (and is never clobbered by an empty heartbeat).
+    ``consumed_cursor`` advances (and is never clobbered by an empty heartbeat).
     """
 
     sent: bool
     turn_id: str
     turn_number: int
-    consumed_offset: int
+    consumed_cursor: str
 
 
 class SubagentActivities:
@@ -156,7 +156,7 @@ class SubagentActivities:
             output=output,
             turn_id=progress.turn_id,
             turn_number=progress.turn_number,
-            consumed_offset=progress.consumed_offset,
+            consumed_cursor=progress.consumed_cursor,
         )
 
     async def _consume_child_turn(
@@ -165,8 +165,8 @@ class SubagentActivities:
         """Stream ONE child turn's events to completion; return ``(reply_output, got_reply)``.
 
         The activity's minimal single-CHILD-stream reader — the replacement for the former
-        ``AgentClient._stream_turn``. Subscribes the child's own stream from
-        ``progress.consumed_offset`` (mutating it as events pass, so the auto-heartbeat memo stays
+        ``AgentClient._stream_turn``. Follows the child's own stream after
+        ``progress.consumed_cursor`` (mutating it as events pass, so the auto-heartbeat memo stays
         current for a resume), filters to ``progress.turn_id``, captures the ``AgentReply`` output,
         and stops at that turn's ``turn_end``. The turn's terminal error is surfaced as a
         non-retryable ``SubagentTurnError``.
@@ -176,36 +176,39 @@ class SubagentActivities:
         subagent streams into one logical view is a separate CLIENT-side concern (``stream_merge``);
         an activity that gated on a grandchild's ``turn_end`` (a turn it never mounts) would wedge.
         """
-        stream = WorkflowStreamClient.create(self._client, req.child_workflow_id)
         output: dict[str, Any] = {}
         got_reply = False
-        async for item in stream.subscribe(
-            topics=[TURN_EVENTS_TOPIC],
-            from_offset=progress.consumed_offset,
-            result_type=AgentEvent,
-            poll_cooldown=timedelta(milliseconds=10),
-        ):
-            # Advance the resume offset for EVERY item seen (mutated in place so the background
-            # heartbeat re-sends the latest), then act only on our turn's events.
-            progress.consumed_offset = item.offset + 1
-            envelope: AgentEvent = item.data
-            if envelope.turn_id != progress.turn_id:
-                continue
-            payload = envelope.event
-            if payload.type == AgentEventType.ERROR:
-                # Carry the child's ACTUAL accepted turn number so the parent closes the bracket
-                # on the same turn the dispatch marker opened (see _accepted_turn_from_error).
-                raise ApplicationError(
-                    payload.message or "subagent turn failed",
-                    {"subagent_turn": progress.turn_number},
-                    type="SubagentTurnError",
-                    non_retryable=True,
-                )
-            if payload.type == AgentEventType.REPLY:
-                output = payload.output
-                got_reply = True
-            if payload.type == AgentEventType.TURN_END:
-                break
+        events = follow_turn_events(
+            self._client, req.child_workflow_id, after=progress.consumed_cursor
+        )
+        try:
+            async for record in events:
+                # Advance the resume cursor for EVERY record seen (mutated in place so the
+                # background heartbeat re-sends the latest), then act only on our turn's events.
+                progress.consumed_cursor = record.cursor.token
+                envelope: AgentEvent = record.value
+                if envelope.turn_id != progress.turn_id:
+                    continue
+                payload = envelope.event
+                if payload.type == AgentEventType.ERROR:
+                    # Carry the child's ACTUAL accepted turn number so the parent closes the
+                    # bracket on the same turn the dispatch marker opened (see
+                    # _accepted_turn_from_error).
+                    raise ApplicationError(
+                        payload.message or "subagent turn failed",
+                        {"subagent_turn": progress.turn_number},
+                        type="SubagentTurnError",
+                        non_retryable=True,
+                    )
+                if payload.type == AgentEventType.REPLY:
+                    output = payload.output
+                    got_reply = True
+                if payload.type == AgentEventType.TURN_END:
+                    break
+        finally:
+            # Closed explicitly: on the shipped transport the subscription is a long poll parked
+            # against the child, and leaving it to garbage collection would hold it open.
+            await events.aclose()
         return output, got_reply
 
     @asynccontextmanager
@@ -251,7 +254,7 @@ class SubagentActivities:
         translates a rejection into a non-retryable :class:`ApplicationError` that preserves
         the child's error ``type`` (``StaleTurn`` / ``AgentBusy`` / ``UnknownFunction`` /
         ``MalformedMessage``), so the calling tool can surface it verbatim. The memo seeds its
-        ``consumed_offset`` from the caller-supplied ``req.from_offset`` (the perf hint — see
+        ``consumed_cursor`` from the caller-supplied ``req.after_cursor`` (the perf hint — see
         :class:`RunSubagentTurnInput`); the stream then advances it from there.
         """
         try:
@@ -273,7 +276,7 @@ class SubagentActivities:
             sent=True,
             turn_id=result.turn_id,
             turn_number=result.turn_number,
-            consumed_offset=req.from_offset,
+            consumed_cursor=req.after_cursor,
         )
 
     @staticmethod
@@ -297,10 +300,10 @@ class SubagentActivities:
                     workflow_id=req.child_workflow_id,
                     function=req.type,
                     subagent_turn=progress.turn_number,
-                    # The child stream offset this turn's events begin at (the perf-hint offset
-                    # the parent resumed from) — lets a client merging the parent + child streams
+                    # The child stream record this turn's events follow (the perf-hint cursor
+                    # the parent resumed after) — lets a client merging the parent + child streams
                     # mount the child cursor at the right spot when resuming mid-session.
-                    from_offset=req.from_offset,
+                    after_cursor=req.after_cursor,
                 )
             )
 

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ast
 import contextvars
 import inspect
@@ -36,13 +37,7 @@ from typing import (
 )
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
-from temporalio import activity, workflow
-from temporalio.contrib.workflow_streams import (
-    TopicHandle,
-    WorkflowStream,
-    WorkflowStreamClient,
-    WorkflowTopicHandle,
-)
+from temporalio import activity, streams, workflow
 from temporalio.exceptions import ApplicationError
 from temporalio.workflow import ActivityConfig
 
@@ -112,6 +107,10 @@ from temporal_agent_harness.harness.slash_commands import (
 # lives in its own leaf module so the sandbox-safe activity contracts in agent_protocol can embed
 # it without a circular import back through this module.
 from temporal_agent_harness.harness.stream_context import TurnStreamContext
+from temporal_agent_harness.harness.stream_transport import (
+    ActivityPublisher,
+    publisher_for_activity,
+)
 
 # ParamSpec/return-type vars for the tool decorators. They let each be typed as an
 # identity over the wrapped callable (``Callable[P, Awaitable[R]] -> Callable[P,
@@ -675,14 +674,13 @@ class TurnEventPublisher:
     Bound to a :class:`TurnStreamContext` at construction so call sites
     don't have to re-thread turn metadata on every publish. Obtain one
     via :meth:`AgentWorkflowRunner.publisher_from_activity` (an async
-    context manager that owns the underlying
-    :class:`WorkflowStreamClient` lifecycle so deltas batch and drain
-    correctly).
+    context manager that owns the underlying batched producer so deltas
+    batch and drain correctly).
     """
 
     def __init__(
         self,
-        events: TopicHandle[AgentEvent],
+        events: ActivityPublisher,
         context: TurnStreamContext,
     ) -> None:
         self._events = events
@@ -818,8 +816,8 @@ class _SubagentInstance:
 
     Holds the per-subagent turn bookkeeping the ``send_<function>`` tool threads to the
     ``run_subagent_turn`` activity: ``next_expected_turn`` (the child's next turn number, sent
-    as ``expected_turn`` and advanced as turns complete) and ``last_consumed_offset`` (the
-    child stream position to resume the next turn from — a perf hint).
+    as ``expected_turn`` and advanced as turns complete) and ``last_consumed_cursor`` (the
+    child stream record to resume the next turn after — a perf hint, opaque to the workflow).
 
     It also owns a **FIFO gate** that serializes this subagent's turns ON THE CALLER SIDE: when
     a parent issues several ``send_<function>`` calls to the same subagent at once (e.g.
@@ -834,7 +832,7 @@ class _SubagentInstance:
     workflow_id: str
     agent_key: str
     next_expected_turn: int = 1
-    last_consumed_offset: int = 0
+    last_consumed_cursor: str = ""
     # FIFO gate: tickets handed out in call order; the holder whose ticket == _serving runs.
     _next_ticket: int = 0
     _serving: int = 0
@@ -886,6 +884,9 @@ class _WorkflowStatus:
         self._current_turn: int = 0
         self._current_turn_id: str | None = None
         self._turn_active: bool = False
+        # How many events this agent has published from workflow code; stamped on each as
+        # ``AgentEvent.seq`` and reported as ``AgentStatus.last_event_seq``.
+        self._event_seq: int = 0
         self._pending_turns: list[tuple[AgentMessage, str]] = []
         self._is_message_queuing_enabled: bool = is_message_queuing_enabled
         self._approval_policy: ToolApprovalPolicy = approval_policy
@@ -902,6 +903,11 @@ class _WorkflowStatus:
     @property
     def current_turn(self) -> int:
         return self._current_turn
+
+    def next_event_seq(self) -> int:
+        """Number the next event this agent publishes from workflow code."""
+        self._event_seq += 1
+        return self._event_seq
 
     @property
     def current_stream_context(self) -> TurnStreamContext | None:
@@ -1186,6 +1192,7 @@ class _WorkflowStatus:
             agent_id=self._agent_id,
             current_turn=self._current_turn,
             turn_active=self._turn_active,
+            last_event_seq=self._event_seq,
             pending_turns=[
                 PendingTurn(
                     turn_number=self._current_turn + i + 1,
@@ -1226,7 +1233,6 @@ class AgentWorkflowRunner:
         self,
         config: AgentConfig,
         *,
-        stream: WorkflowStream,
         approval_policy_default: ToolApprovalPolicy,
         enable_message_queuing_default: bool = False,
         custom_approval_fallback: CustomApprovalFallback | None = None,
@@ -1236,9 +1242,11 @@ class AgentWorkflowRunner:
 
             self._runner = AgentWorkflowRunner(
                 config,
-                stream=WorkflowStream(),
                 approval_policy_default=ToolApprovalPolicy.allow_inherently_safe(),
             )
+
+        The runner publishes its events through ``temporalio.streams`` on whichever provider
+        the worker was configured with; the agent names no stream and no store.
 
         ``config`` is the standardized agent input; the runner resolves each universal
         knob as *the caller's config value if given, else the agent's default*
@@ -1284,13 +1292,15 @@ class AgentWorkflowRunner:
         # generates its own. workflow.uuid4 is deterministic in-workflow (offline unit tests patch
         # it). Distinct from the full workflow_id, which the model/UI never needs to reproduce.
         self._agent_id: str = config.agent_id or workflow.uuid4().hex[:AGENT_ID_LENGTH]
-        # Retain the WorkflowStream itself (not just the topic handle) so the runner can read
-        # the stream's current head offset in-workflow — see ``_handle_send_agent_message``,
-        # which returns it as ``AgentMessageReply.accepted_offset`` for the client stream-merge.
-        self._stream = stream
-        self._events: WorkflowTopicHandle[AgentEvent] = stream.topic(
-            TURN_EVENTS_TOPIC, type=AgentEvent
-        )
+        if workflow.in_workflow():
+            # Lets the provider install what it needs before the first task completes. A no-op
+            # except on the transport that serves outside readers through handlers on this
+            # workflow, which an early poller would otherwise find missing.
+            streams.prepare()
+        self._events = streams.writer(TURN_EVENTS_TOPIC, type=AgentEvent)
+        # Envelopes queued by ``_pub`` and drained in order by one task; see ``_pub``.
+        self._outbox: list[AgentEvent] = []
+        self._flush_task: asyncio.Task[None] | None = None
         self._custom_approval_fallback = custom_approval_fallback
         self._status = _WorkflowStatus(
             agent_id=self._agent_id,
@@ -1358,14 +1368,6 @@ class AgentWorkflowRunner:
     # -- Protocol handlers --------------------------------------------------
 
     async def _handle_send_agent_message(self, message: AgentMessage) -> AgentMessageReply:
-        # Capture the stream head BEFORE publishing anything for this message: it is the
-        # client stream-merge's read-start hint (``accepted_offset``). The handler body is
-        # synchronous (no await that yields), so this runs atomically before the turn loop can
-        # publish this turn's ``turn_started`` — guaranteeing ``accepted_offset <= turn_started``,
-        # which is all the merge requires (it discards events up to ``turn_started``). Read the
-        # real log head (``_on_offset``), not a publish counter: activity-published events enter
-        # the same global log via signals and would be missed by an in-workflow counter.
-        accepted_offset = self._stream._on_offset()
         turn_id = str(workflow.uuid4())
         pending = self._status.has_pending_work
         turn_number = self._status.enqueue_message(message, turn_id)
@@ -1380,7 +1382,6 @@ class AgentWorkflowRunner:
         return AgentMessageReply(
             turn_number=turn_number,
             turn_id=turn_id,
-            accepted_offset=accepted_offset,
             pending=pending,
         )
 
@@ -1957,6 +1958,13 @@ class AgentWorkflowRunner:
                 # end-of-turn signal) before looping back to wait for the next message.
                 self._status.complete_turn()
                 self._pub(turn_id, turn_number, TurnEnded())
+                await self._settle_outbox()
+        # Whatever is still queued goes out with this task. Then the provider lets go of what
+        # it parked against this run (the shipped transport holds an outside reader's long
+        # poll here), so the workflow can return without stranding a handler.
+        await self._settle_outbox()
+        streams.drain()
+        await workflow.wait_condition(workflow.all_handlers_finished)
 
     async def _dispatch_turn(self, agent: object, envelope: AgentMessage) -> BaseModel:
         """Dispatch one already-validated turn envelope and return its reply model."""
@@ -2107,7 +2115,7 @@ class AgentWorkflowRunner:
         to the child instance, serializes turns to it through that subagent's FIFO gate (so
         concurrent ``gather``-ed sends run in the model's call order, one at a time), then
         dispatches the single ``run_subagent_turn`` activity against the real child
-        ``workflow_id`` with the now-exact ``expected_turn`` + resume ``from_offset``, and
+        ``workflow_id`` with the now-exact ``expected_turn`` + resume ``after_cursor``, and
         advances the local bookkeeping on completion.
 
         A ticket is taken **synchronously** (before the first ``await``) so gathered callers are
@@ -2150,7 +2158,7 @@ class AgentWorkflowRunner:
                         type=msg_type,
                         payload=payload,
                         expected_turn=expected,
-                        from_offset=inst.last_consumed_offset,
+                        after_cursor=inst.last_consumed_cursor,
                         handle=inst.handle,
                         agent_key=inst.agent_key,
                         parent_stream_context=stream_context,
@@ -2184,7 +2192,7 @@ class AgentWorkflowRunner:
                     )
                 raise
             inst.next_expected_turn = result.turn_number + 1
-            inst.last_consumed_offset = result.consumed_offset
+            inst.last_consumed_cursor = result.consumed_cursor
             # Close the bracket on OUR stream now that the agent (this workflow) actually holds
             # the reply — BEFORE ``release_gate()`` in the finally, so this turn's reply_received
             # is published ahead of the next gathered turn's message_sent (the merge relies on
@@ -2266,11 +2274,11 @@ class AgentWorkflowRunner:
 
         Use from within a ``@activity.defn`` that needs to publish
         turn events (e.g. ``reply_delta`` chunks from a streaming model
-        call) to its parent workflow's :class:`WorkflowStream`.
+        call) onto its parent workflow's ``turn_events`` topic.
 
-        Encapsulates the :class:`WorkflowStreamClient` lifecycle (entered
-        for batched flushing, exited so the tail drains before the
-        activity returns) and the topic binding. Activities just call
+        Encapsulates the batched producer's lifecycle (entered for
+        batched flushing, exited so the tail drains before the activity
+        returns) and the topic binding. Activities just call
         ``publisher.publish(...)``.
 
         Args:
@@ -2279,24 +2287,20 @@ class AgentWorkflowRunner:
                 :attr:`AgentWorkflowRunner.current_stream_context` and
                 forwarded opaquely through activity inputs.
             batch_interval: Background flush cadence on the underlying
-                stream client. Default 50ms keeps the UI feel snappy.
+                producer. Default 50ms keeps the UI feel snappy.
 
         Yields:
             A :class:`TurnEventPublisher` bound to the active workflow
             (resolved from the activity context) and the given turn.
         """
-        client = WorkflowStreamClient.from_within_activity(
-            batch_interval=batch_interval,
-        )
-        # ``from_within_activity`` targets the workflow that SCHEDULED this activity (always the
-        # publishing agent), so events land on the right stream. The agent's SHORT id to stamp them
-        # with is not derivable from ``activity.info()`` (which only knows the workflow_id), so it
-        # rides in on the threaded ``context`` (TurnStreamContext.agent_id).
-        async with client:
-            yield TurnEventPublisher(
-                events=client.topic(TURN_EVENTS_TOPIC, type=AgentEvent),
-                context=context,
-            )
+        # The producer targets the workflow that SCHEDULED this activity (always the publishing
+        # agent), so events land on the right stream. The agent's SHORT id to stamp them with is
+        # not derivable from ``activity.info()`` (which only knows the workflow_id), so it rides
+        # in on the threaded ``context`` (TurnStreamContext.agent_id).
+        async with publisher_for_activity(
+            TURN_EVENTS_TOPIC, batch_interval=batch_interval
+        ) as events:
+            yield TurnEventPublisher(events=events, context=context)
 
     # -- Tool execution -----------------------------------------------------
 
@@ -2353,19 +2357,54 @@ class AgentWorkflowRunner:
     # -- Internal -----------------------------------------------------------
 
     def _pub(self, turn_id: str, turn_number: int, event: AgentStreamItem) -> None:
-        """Wrap ``event`` in an :class:`AgentEvent` envelope and publish it."""
-        self._events.publish(
-            AgentEvent(
-                event=event,
-                # This agent's own short id — so every event on the stream self-identifies its
-                # source agent for the client stream-merge (and a single-agent consumer can filter
-                # by it). For a subagent this is the handle its parent references it by.
-                agent_id=self._agent_id,
-                turn_id=turn_id,
-                turn_number=turn_number,
-                timestamp=workflow.time(),
-            )
+        """Wrap ``event`` in an :class:`AgentEvent` envelope and queue it for publishing."""
+        envelope = AgentEvent(
+            event=event,
+            # This agent's own short id — so every event on the stream self-identifies its
+            # source agent for the client stream-merge (and a single-agent consumer can filter
+            # by it). For a subagent this is the handle its parent references it by.
+            agent_id=self._agent_id,
+            turn_id=turn_id,
+            turn_number=turn_number,
+            timestamp=workflow.time(),
+            seq=self._status.next_event_seq(),
         )
+        # The writer's publish awaits its provider (one of them applies back pressure) while
+        # most publish sites here are synchronous, so envelopes queue and one task drains them
+        # in the order they were queued. A drain that failed is left in place: its exception
+        # belongs to whoever settles the outbox next, and a fresh drain would discard it.
+        self._outbox.append(envelope)
+        task = self._flush_task
+        if task is None or (task.done() and not task.cancelled() and task.exception() is None):
+            self._flush_task = self._start_drain()
+
+    def _start_drain(self) -> asyncio.Task[None]:
+        # The workflow sandbox installs its own loop as the running one, so the same call
+        # serves a workflow and a runner built offline in an async test.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            raise RuntimeError("publishing needs a running event loop") from None
+        return loop.create_task(self._flush_outbox())
+
+    async def _flush_outbox(self) -> None:
+        # Pop only after the publish returned, so an envelope the provider refused stays at the
+        # head rather than vanishing with the exception.
+        while self._outbox:
+            await self._events.publish(self._outbox[0])
+            self._outbox.pop(0)
+
+    async def _settle_outbox(self) -> None:
+        """Wait until the drain has published everything queued.
+
+        The drain runs as its own task, so a publish that raised would otherwise die with it
+        unnoticed. Awaiting it here fails the workflow task instead, and a caller sees the
+        refused envelope still at the head of the outbox.
+        """
+        while self._flush_task is not None and not self._flush_task.done():
+            await self._flush_task
+        if self._flush_task is not None:
+            self._flush_task.result()
 
 
 # ---------------------------------------------------------------------------

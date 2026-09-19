@@ -112,7 +112,9 @@ func textMetadata(input Input, text string) TextMetadata {
 // postResp polls a turn to completion and posts all text as one message for
 // outbound conversations that do not support native streams.
 func (w *RouterWorkflow) postResp(ctx workflow.Context, handle TurnHandle, input Input) error {
-	cursor := handle.StreamHeadOffset
+	// From the beginning: the backend drops events of earlier turns, and the stream position
+	// belongs to the provider, so there is nothing for the handle to carry.
+	cursor := ""
 	fullText := ""
 	hasContent := false
 	var citations []Citation
@@ -171,7 +173,9 @@ func (w *RouterWorkflow) postResp(ctx workflow.Context, handle TurnHandle, input
 // through the outbound driver, until the turn closes. This loop is generic over any
 // backend/outbound pairing: it only deals in Delta and OutboundDriver calls.
 func (w *RouterWorkflow) streamResp(ctx workflow.Context, handle TurnHandle, input Input) error {
-	cursor := handle.StreamHeadOffset
+	// From the beginning: the backend drops events of earlier turns, and the stream position
+	// belongs to the provider, so there is nothing for the handle to carry.
+	cursor := ""
 	pollInterval := w.outbound.StreamPollInterval(input)
 
 	// Start the initial outbound stream before polling. If the outbound driver can't

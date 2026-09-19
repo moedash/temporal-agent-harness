@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
@@ -26,9 +26,10 @@ from pydantic import BaseModel
 from temporalio import workflow
 from temporalio.client import Client, WorkflowHandle, WorkflowUpdateFailedError
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+
+from tests._streams import turn_events, worker_options, workflow_environment
 
 from temporal_agent_harness.harness import AgentWorkflowRunner, agent, slash_commands
 from temporal_agent_harness.harness.agent_protocol import (
@@ -50,6 +51,7 @@ from temporal_agent_harness.harness.agent_protocol import (
     TextMessage,
     TextReply,
     ToolApprovalPolicy,
+    TurnEnded,
     AgentMessageReply,
     SlashCommand,
 )
@@ -109,7 +111,6 @@ class TypedProbeAgent:
     def __init__(self, config: AgentConfig) -> None:
         self._runner = AgentWorkflowRunner(
             config,
-            stream=WorkflowStream(),
             # Default queuing on (tests send several messages back-to-back); a config
             # value would still win over this default.
             enable_message_queuing_default=True,
@@ -154,7 +155,6 @@ class SlashExtensionProbeAgent:
     def __init__(self, config: AgentConfig) -> None:
         self._runner = AgentWorkflowRunner(
             config,
-            stream=WorkflowStream(),
             approval_policy_default=ToolApprovalPolicy.always_require_approvals(),
             slash_commands=[
                 *slash_commands.default_commands(),
@@ -185,12 +185,13 @@ class SlashExtensionProbeAgent:
 @pytest_asyncio.fixture
 async def client_and_queue():
     """A time-skipping env (pydantic converter) with a worker hosting the probe."""
-    env = await WorkflowEnvironment.start_time_skipping(
+    env = await workflow_environment(
         data_converter=pydantic_data_converter
     )
     task_queue = f"agent-workflow-runner-test-{uuid.uuid4()}"
     async with Worker(
         env.client,
+        **worker_options(),
         task_queue=task_queue,
         workflows=[TypedProbeAgent, SlashExtensionProbeAgent],
         # Unsandboxed so the test module's imports (pydantic, harness, pytest) don't
@@ -458,8 +459,7 @@ async def test_attach_replays_operator_only_history_and_stops(client_and_queue):
     agent_client = AgentClient(client, handle.id)
 
     stream = await agent_client.attach(
-        from_offset=0,
-        on_item=lambda item, _resume_offset: item,
+        on_item=lambda item, _resume: item,
     )
 
     items: list[AgentEvent] = []
@@ -528,21 +528,11 @@ async def test_configured_core_command_preempts_agent_extension(
 
 
 async def _collect_until_turn_end(client: Client, workflow_id: str) -> list[AgentEvent]:
-    from datetime import timedelta
-
-    from temporalio.contrib.workflow_streams import WorkflowStreamClient
-
-    stream = WorkflowStreamClient.create(client, workflow_id)
     events: list[AgentEvent] = []
     async with asyncio.timeout(30):
-        async for item in stream.subscribe(
-            topics=["turn_events"],
-            from_offset=0,
-            result_type=AgentEvent,
-            poll_cooldown=timedelta(milliseconds=10),
-        ):
-            events.append(item.data)
-            if item.data.event.type == AgentEventType.TURN_END:
+        async for envelope in turn_events(client, workflow_id):
+            events.append(envelope)
+            if envelope.event.type == AgentEventType.TURN_END:
                 break
     return events
 
@@ -550,21 +540,11 @@ async def _collect_until_turn_end(client: Client, workflow_id: str) -> list[Agen
 async def _collect_until_operator_terminal(
     client: Client, workflow_id: str
 ) -> list[AgentEvent]:
-    from datetime import timedelta
-
-    from temporalio.contrib.workflow_streams import WorkflowStreamClient
-
-    stream = WorkflowStreamClient.create(client, workflow_id)
     events: list[AgentEvent] = []
     async with asyncio.timeout(30):
-        async for item in stream.subscribe(
-            topics=["turn_events"],
-            from_offset=0,
-            result_type=AgentEvent,
-            poll_cooldown=timedelta(milliseconds=10),
-        ):
-            events.append(item.data)
-            if item.data.event.type in {
+        async for envelope in turn_events(client, workflow_id):
+            events.append(envelope)
+            if envelope.event.type in {
                 AgentEventType.OPERATOR_COMMAND_COMPLETED,
                 AgentEventType.OPERATOR_COMMAND_FAILED,
             }:
@@ -783,22 +763,13 @@ def test_agent_defn_rejects_bespoke_input_at_definition_time():
 # ---------------------------------------------------------------------------
 
 
-def test_stream_and_approval_policy_default_are_required():
-    """``stream`` and ``approval_policy_default`` are required keyword-only constructor
-    args, so omitting either is a call-site TypeError — no runtime ``build()`` check to
-    forget. The author must make a deliberate safe-by-default approval choice."""
-    stream = MagicMock()
-    stream.topic.return_value = MagicMock()
+def test_approval_policy_default_is_required():
+    """``approval_policy_default`` is a required keyword-only constructor arg, so omitting it
+    is a call-site TypeError — no runtime ``build()`` check to forget. The author must make a
+    deliberate safe-by-default approval choice."""
     with pytest.raises(TypeError):
-        AgentWorkflowRunner(  # type: ignore[call-arg]  — missing stream
-            AgentConfig(),
-            approval_policy_default=ToolApprovalPolicy.dangerously_skip_all(),
-        )
-    with pytest.raises(TypeError):
-        AgentWorkflowRunner(  # type: ignore[call-arg]  — missing approval_policy_default
-            AgentConfig(),
-            stream=stream,
-        )
+        # approval_policy_default is deliberately missing.
+        AgentWorkflowRunner(AgentConfig())  # type: ignore[call-arg]
 
 
 def test_message_queuing_resolves_config_over_agent_default(offline_build):
@@ -836,7 +807,7 @@ def test_approval_policy_resolves_config_over_agent_default(offline_build_policy
     )
 
 
-def test_set_approval_policy_resolves_matching_pending(offline_build_policy):
+async def test_set_approval_policy_resolves_matching_pending(offline_build_policy):
     from temporal_agent_harness.harness.agent_workflow import _ApprovalStatus
 
     runner = offline_build_policy(
@@ -850,6 +821,7 @@ def test_set_approval_policy_resolves_matching_pending(offline_build_policy):
     )
 
     runner.set_approval_policy(ToolApprovalPolicy.allow_tools(["trusted_tool"]))
+    await runner._settle_outbox()
 
     assert runner._status.is_approval_resolved("t1") is True
     entry = runner._status.approval_entry("t1")
@@ -915,7 +887,7 @@ def test_protocol_types_use_concrete_annotations():
             )
 
 
-def test_errored_subagent_turn_closes_bracket_on_actual_accepted_turn(offline_build):
+async def test_errored_subagent_turn_closes_bracket_on_actual_accepted_turn(offline_build):
     """On an accepted-but-errored child turn, the parent closes the
     [subagent_message_sent … subagent_reply_received] bracket on the child's ACTUAL accepted turn
     number — which the activity threads through the error details — not a re-derived ``expected``.
@@ -945,8 +917,9 @@ def test_errored_subagent_turn_closes_bracket_on_actual_accepted_turn(offline_bu
     runner._publish_subagent_reply_received(
         inst, "run_script", accepted, outcome="error"
     )
+    await runner._settle_outbox()
 
-    published = [c.args[0] for c in runner._events.publish.call_args_list]
+    published = [c.args[0] for c in runner._events.publish.await_args_list]
     replies = [e for e in published if isinstance(e.event, SubagentReplyReceived)]
     assert len(replies) == 1
     rr = replies[0].event
@@ -956,6 +929,44 @@ def test_errored_subagent_turn_closes_bracket_on_actual_accepted_turn(offline_bu
     assert rr.subagent_id == "aaaaaa-bbbbbb"
     # The local turn counter advances off the same accepted turn.
     assert accepted + 1 == 8
+
+
+async def test_offline_publish_reaches_the_writer_in_order(offline_build):
+    """A runner built outside a workflow drains its outbox on the running loop, so what it
+    publishes is awaited on the writer in the order it was queued."""
+    runner = offline_build(AgentConfig())
+    runner._pub("turn-1", 1, TurnEnded())
+    runner._pub("turn-2", 2, TurnEnded())
+    await runner._settle_outbox()
+
+    turns = [c.args[0].turn_id for c in runner._events.publish.await_args_list]
+    assert turns == ["turn-1", "turn-2"]
+    assert runner._outbox == []
+
+
+async def test_refused_publish_stays_queued_and_fails_the_settle(offline_build):
+    """A publish the provider refuses is not lost: the envelope stays at the head of the
+    outbox and the failure surfaces where the run loop settles the outbox."""
+    runner = offline_build(AgentConfig())
+    runner._events.publish.side_effect = [None, RuntimeError("store refused it")]
+    runner._pub("turn-1", 1, TurnEnded())
+    runner._pub("turn-2", 2, TurnEnded())
+
+    with pytest.raises(RuntimeError, match="store refused it"):
+        await runner._settle_outbox()
+    assert [e.turn_id for e in runner._outbox] == ["turn-2"]
+
+    # Nothing queued afterwards starts a drain that would bury the failure.
+    runner._pub("turn-3", 3, TurnEnded())
+    with pytest.raises(RuntimeError, match="store refused it"):
+        await runner._settle_outbox()
+    assert [e.turn_id for e in runner._outbox] == ["turn-2", "turn-3"]
+
+
+def test_publish_without_a_running_loop_is_refused(offline_build):
+    runner = offline_build(AgentConfig())
+    with pytest.raises(RuntimeError, match="running event loop"):
+        runner._pub("turn-1", 1, TurnEnded())
 
 
 def test_accepted_turn_from_error_falls_back_when_detail_absent():
@@ -980,6 +991,10 @@ def offline_build(monkeypatch):
     # The runner generates its short agent_id from workflow.uuid4() in __init__; offline there is
     # no workflow loop, so stub it with a plain uuid.
     monkeypatch.setattr(aw.workflow, "uuid4", lambda: uuid.uuid4())
+    # Offline there is no provider to bind a writer on; a mock records what the runner publishes.
+    # Its publish is awaitable like the real one, so a publish that was only called and never
+    # awaited shows up as a missing await rather than passing by accident.
+    monkeypatch.setattr(aw.streams, "writer", lambda *a, **k: MagicMock(publish=AsyncMock()))
 
     def build(
         config: AgentConfig,
@@ -987,8 +1002,6 @@ def offline_build(monkeypatch):
         default: bool | None = None,
         slash_commands=None,
     ):
-        stream = MagicMock()
-        stream.topic.return_value = MagicMock()
         kwargs: dict[str, Any] = {}
         if default is not None:
             kwargs["enable_message_queuing_default"] = default
@@ -996,7 +1009,6 @@ def offline_build(monkeypatch):
             kwargs["slash_commands"] = slash_commands
         return AgentWorkflowRunner(
             config,
-            stream=stream,
             approval_policy_default=ToolApprovalPolicy.dangerously_skip_all(),
             **kwargs,
         )
@@ -1014,13 +1026,11 @@ def offline_build_policy(monkeypatch):
     # The runner generates its short agent_id from workflow.uuid4() in __init__; offline there is
     # no workflow loop, so stub it with a plain uuid.
     monkeypatch.setattr(aw.workflow, "uuid4", lambda: uuid.uuid4())
+    monkeypatch.setattr(aw.streams, "writer", lambda *a, **k: MagicMock(publish=AsyncMock()))
 
     def build(config: AgentConfig, *, default: ToolApprovalPolicy, custom_fallback=None):
-        stream = MagicMock()
-        stream.topic.return_value = MagicMock()
         return AgentWorkflowRunner(
             config,
-            stream=stream,
             approval_policy_default=default,
             custom_approval_fallback=custom_fallback,
         )

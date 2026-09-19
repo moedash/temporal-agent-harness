@@ -12,7 +12,6 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any, TypeVar
 
 from temporalio.client import Client, WithStartWorkflowOperation, WorkflowUpdateFailedError
-from temporalio.contrib.workflow_streams import WorkflowStreamClient
 
 from temporalio.common import WorkflowIDConflictPolicy
 
@@ -43,11 +42,13 @@ from temporal_agent_harness.harness.agent_protocol import (
 )
 from temporal_agent_harness.harness.stream_merge import (
     DEFAULT_STALL_GRACE_SECONDS,
+    ResumePoint,
     merge_stream,
     select_live,
     select_replay,
 )
 from temporal_agent_harness.harness.stream_merge.cursor import Cursor
+from temporal_agent_harness.harness.stream_transport import latest_turn_event, provider_name
 
 # Client default: maximum seconds to wait for a turn to complete.
 DEFAULT_TURN_TIMEOUT = 300.0
@@ -111,13 +112,13 @@ class CallbackResultError(Exception):
 # Must be defined after the exception classes since it references them at runtime.
 AgentStreamOutput = AgentEvent | AgentTurnError | AgentTurnTimeout
 
-# The callback signature: (item, resume_offset) -> T
-# ``resume_offset`` is the merge's ROOT-stream resume CURSOR as of this item — a value the consumer
-# records and hands back as ``attach(from_offset=...)`` to resume. It is NOT the event's own
-# per-stream offset and NOT a merged display ordinal: it advances only on ROOT events, so every event
-# within one subagent turn carries the same value (the cursor as of that turn's dispatch). See
-# ``stream_merge.merge.MergedItem``.
-OnItemCallback = Callable[[AgentStreamOutput, int], T]
+# The callback signature: (item, resume) -> T
+# ``resume`` is the merge's ROOT-stream resume point as of this item — a value the consumer
+# records (``resume.encode()``) and hands back as ``attach(resume=...)`` to resume. It is NOT the
+# event's own per-stream cursor and NOT a merged display ordinal: it advances only on ROOT
+# events, so every event within one subagent turn carries the same value (the point as of that
+# turn's dispatch). See ``stream_merge.merge.MergedItem``.
+OnItemCallback = Callable[[AgentStreamOutput, ResumePoint], T]
 
 
 # ---------------------------------------------------------------------------
@@ -423,19 +424,20 @@ class AgentClient:
 
         Phase 1, :meth:`_submit_message`, runs eagerly here so ``StaleTurnError`` /
         ``AgentBusyError`` are raised *before* any streaming begins (and before the merge is even
-        constructed — there is no failure path after the agent has accepted). The update returns an
-        ``accepted_offset``; phase 2 then drives the client-side stream-merge from there: it skips
-        to this turn's ``turn_started`` (a quiescent start) and yields every event of the turn,
-        coalescing the agent's own stream with each subagent stream it drives (recursively), in a
+        constructed — there is no failure path after the agent has accepted). The client reads the
+        stream's latest position before submitting, so the turn's first record cannot slip past
+        it; phase 2 then drives the client-side stream-merge from there: it skips to this turn's
+        ``turn_started`` (a quiescent start) and yields every event of the turn, coalescing the
+        agent's own stream with each subagent stream it drives (recursively), in a
         semantically-valid order — through to this turn's ``turn_end``. The caller never tracks or
-        passes an offset.
+        passes a position.
 
         Args:
             msg_type: Name of the target ``@agent.accepts`` handler.
             payload: JSON of that handler's input model.
             expected_turn: The turn number the client expects this message to be.
-            on_item: Callback ``(AgentStreamOutput, resume_offset) -> T`` applied to each output.
-                ``resume_offset`` is the merge's ROOT-stream resume cursor as of this item (see
+            on_item: Callback ``(AgentStreamOutput, resume) -> T`` applied to each output.
+                ``resume`` is the merge's ROOT-stream resume point as of this item (see
                 :meth:`attach`); the per-turn path doesn't resume on it (the chat path reattaches via
                 :meth:`attach`), but it is passed through uniformly so a caller's bookkeeping is
                 consistent across both entry points.
@@ -456,9 +458,14 @@ class AgentClient:
             StaleTurnError: The client is behind the workflow.
             AgentBusyError: The agent is busy and does not support enqueuing.
         """
+        # Positioned before submitting, so the turn's first record cannot land before the reader
+        # is looking. The workflow does not know where its records land, so the client asks the
+        # stream rather than the agent.
+        since = await latest_turn_event(self._temporal, self._workflow_id)
         reply = await self._submit_message(msg_type, payload, expected_turn)
         return self._merged_turn(
             reply,
+            since=since,
             on_item=on_item,
             timeout=timeout,
             stall_grace_seconds=subagent_stall_grace_seconds,
@@ -468,17 +475,19 @@ class AgentClient:
         self,
         reply: AgentMessageReply,
         *,
+        since: str,
         on_item: OnItemCallback[T],
         timeout: float | None,
         stall_grace_seconds: float,
     ) -> AsyncIterator[T]:
         """Phase 2 of :meth:`send_message`: drive the merge for one submitted turn.
 
-        Reads from ``reply.accepted_offset`` and skips to ``reply.turn_id``'s ``turn_started``,
-        then merges live (arrival-order interleaving) until that turn's ``turn_end`` on the ROOT
-        agent — by which point, via the close gate, every subagent turn it triggered has already
-        been emitted. The turn's own terminal error is surfaced as an :class:`AgentTurnError`
-        (matching the legacy behavior); on timeout an :class:`AgentTurnTimeout` is yielded last.
+        Reads after ``since`` (the position captured before submitting) and skips to
+        ``reply.turn_id``'s ``turn_started``, then merges live (arrival-order interleaving) until
+        that turn's ``turn_end`` on the ROOT agent — by which point, via the close gate, every
+        subagent turn it triggered has already been emitted. The turn's own terminal error is
+        surfaced as an :class:`AgentTurnError` (matching the legacy behavior); on timeout an
+        :class:`AgentTurnTimeout` is yielded last.
         """
         target_turn_id = reply.turn_id
 
@@ -492,7 +501,7 @@ class AgentClient:
         merged = merge_stream(
             client=self._temporal,
             root_workflow_id=self._workflow_id,
-            root_from_offset=reply.accepted_offset,
+            root_resume=ResumePoint(cursor=since),
             skip_until_turn_id=target_turn_id,
             select=select_live,
             should_stop=should_stop,
@@ -500,10 +509,10 @@ class AgentClient:
         )
         try:
             async with asyncio.timeout(timeout):
-                # ``resume_offset`` is the merge's ROOT-stream resume cursor; for a single
-                # send_message turn it isn't used to resume (the chat path reattaches via ``attach``),
-                # but we pass it through uniformly so the consumer's bookkeeping stays consistent.
-                async for ev, resume_offset in merged:
+                # ``resume`` is the merge's ROOT-stream resume point; for a single send_message
+                # turn it isn't used to resume (the chat path reattaches via ``attach``), but we
+                # pass it through uniformly so the consumer's bookkeeping stays consistent.
+                async for ev, resume in merged:
                     # ``turn_id`` is a globally-unique uuid, so it alone identifies OUR turn's
                     # terminal error (a subagent's error carries a different turn_id) — no need to
                     # also match on agent_id.
@@ -516,78 +525,87 @@ class AgentClient:
                         # subtree; turn_end still follows as the real terminal).
                         yield on_item(
                             AgentTurnError(ev.event.message or "agent turn failed"),
-                            resume_offset,
+                            resume,
                         )
                     else:
-                        yield on_item(ev, resume_offset)
+                        yield on_item(ev, resume)
         except TimeoutError:
             yield on_item(
                 AgentTurnTimeout(
                     f"turn {reply.turn_number} did not complete within {timeout}s"
                 ),
-                -1,
+                ResumePoint(),
             )
 
     async def attach(
         self,
         *,
         on_item: OnItemCallback[T],
-        from_offset: int = 0,
+        resume: str = "",
         subagent_stall_grace_seconds: float = DEFAULT_STALL_GRACE_SECONDS,
     ) -> AsyncIterator[T]:
         """Reattach to a session and stream it as ONE merged logical stream, then tail live.
 
-        ``from_offset`` controls where the merge starts (and ANY offset is valid — see below):
+        ``resume`` controls where the merge starts (and ANY stored point is valid — see below):
 
-        * **0 (default)** — full replay from the beginning, for a blank-slate consumer (a freshly
-          loaded tab) that has no prior state. Replays past events deterministically (mount-order
-          interleaving), then follows live until the agent is idle.
-        * **any prior resume offset** — resume: stream from exactly that ROOT offset onward, so
-          already-seen events are not re-sent. The one consequence of resuming *inside* a subagent's
-          turn (an offset after that subagent's ``subagent_message_sent`` but before its
-          ``subagent_reply_received``): that subagent's OWN events are absent from the resumed stream
-          (the merge never saw its turn start, so it can't mount its stream), though the parent's
-          ``subagent_reply_received`` and everything after it still flow. Subagents dispatched at or
-          after ``from_offset`` merge normally.
+        * **empty (default)** — full replay from the beginning, for a blank-slate consumer (a
+          freshly loaded tab) that has no prior state. Replays past events deterministically
+          (mount-order interleaving), then follows live until the agent is idle.
+        * **an encoded resume point** — resume: stream from just past that ROOT record onward, so
+          already-seen events are not re-sent. The one consequence of resuming *inside* a
+          subagent's turn (a point after that subagent's ``subagent_message_sent`` but before its
+          ``subagent_reply_received``): that subagent's OWN events are absent from the resumed
+          stream (the merge never saw its turn start, so it can't mount its stream), though the
+          parent's ``subagent_reply_received`` and everything after it still flow. Subagents
+          dispatched after the point merge normally.
 
-        ``on_item`` receives ``(item, resume_offset)``. **``resume_offset`` is a ROOT-stream offset
-        and advances ONLY on root events** — record the latest and pass it back as ``from_offset`` to
+        ``on_item`` receives ``(item, resume)``. **``resume`` is a ROOT-stream point and advances
+        ONLY on root events** — record the latest (``resume.encode()``) and pass it back to
         resume. Two consequences a caller must not miss:
 
         * It is the root-stream position, NOT the merge's display ordinal — the cross-stream
           interleaving itself is not a resumable position.
         * Resume granularity is therefore **per-root-event, not per-subagent-event**. Every subagent
-          event between two root events carries the SAME ``resume_offset`` (the position just past
-          the preceding root event). So a consumer that disconnects *mid a subagent's turn* and
+          event between two root events carries the SAME point (the position just past the
+          preceding root event). So a consumer that disconnects *mid a subagent's turn* and
           resumes will NOT re-receive the rest of that subagent's turn detail — on resume the merge
           starts past that subagent's ``subagent_message_sent`` and so never re-mounts it (and emits
           NO ``subagent_stream_unavailable`` marker — it treats the detail as already delivered). The
-          parent's reply and everything after it still flow. This is intended: a scalar root offset
-          is a *valid* resume point (never a broken ordering, never a wedge), but it is lossless only
-          at root-event granularity. A consumer that needs every subagent event across a mid-turn
-          reconnect should re-attach from 0.
+          parent's reply and everything after it still flow. This is intended: a root point is a
+          *valid* resume point (never a broken ordering, never a wedge), but it is lossless only at
+          root-event granularity. A consumer that needs every subagent event across a mid-turn
+          reconnect should re-attach from the beginning.
 
         Returns immediately (yields nothing) if there's nothing new to stream.
 
         ``subagent_stall_grace_seconds`` — see :meth:`send_message`; same liveness backstop, applied
         to the merge that backs this attach.
 
-        Termination mirrors the per-turn close, with one addition for operator-only events:
-        on each ROOT terminal event (``turn_end`` or an operator command terminal event) we
-        re-query status and stop once the workflow is idle and this attach has emitted every
-        root event that existed when it started. This lets a replay that ends with
-        out-of-band operator commands drain them without waiting for a nonexistent turn.
+        Termination mirrors the per-turn close, with one addition for operator-only events: on
+        each ROOT terminal event (``turn_end`` or an operator command terminal event) we re-query
+        status and stop once the workflow is idle and the event just emitted is the last one the
+        agent published (``AgentEvent.seq`` against ``AgentStatus.last_event_seq``). The agent's
+        own count is what makes this provider-independent: a stream position could not say
+        whether anything followed, and asking the provider for one would tie the client to it.
+        This lets a replay that ends with out-of-band operator commands drain them without waiting
+        for a nonexistent turn.
+
+        A ``resume`` that is malformed, or that was minted under another stream provider, raises
+        ``ValueError`` before any I/O, so a caller can answer with a client error and start over.
         """
-        stream = WorkflowStreamClient.create(self._temporal, self._workflow_id)
+        point = ResumePoint.decode(resume, provider=provider_name())
         status = await self.get_status()
-        head = await stream.get_offset()
-        # Already caught up (no events past from_offset) and the agent is idle — nothing to stream.
-        if head <= from_offset and not status.turn_active and not status.pending_turns:
+        # Already caught up (the point is at or past the agent's last word) and the agent is
+        # idle — nothing to stream.
+        if (
+            not status.turn_active
+            and not status.pending_turns
+            and point.seq >= status.last_event_seq
+        ):
             return self._empty()
         return self._merged_attach(
             on_item=on_item,
-            from_offset=from_offset,
-            stop_at_root_offset=head,
+            resume=point,
             stall_grace_seconds=subagent_stall_grace_seconds,
         )
 
@@ -600,51 +618,47 @@ class AgentClient:
         self,
         *,
         on_item: OnItemCallback[T],
-        from_offset: int,
-        stop_at_root_offset: int,
+        resume: ResumePoint,
         stall_grace_seconds: float,
     ) -> AsyncIterator[T]:
-        """Phase 2 of :meth:`attach`: drive the merge from ``from_offset`` to the next idle point.
+        """Phase 2 of :meth:`attach`: drive the merge from ``resume`` to the next idle point.
 
-        No skip at any offset: the merge starts the root exactly at ``from_offset`` (0 = replay
-        everything). Resuming mid-stream is safe — a subagent whose turn began before ``from_offset``
-        is never mounted (its detail is absent, its ``reply_received`` released by the merge's
-        unmounted-stuck give-up), while subagents dispatched at/after it merge normally."""
+        No skip at any point: the merge starts the root just past ``resume.cursor`` (empty =
+        replay everything). Resuming mid-stream is safe — a subagent whose turn began before the
+        point is never mounted (its detail is absent, its ``reply_received`` released by the
+        merge's unmounted-stuck give-up), while subagents dispatched after it merge normally."""
         root_id = self._workflow_id
-        highest_completed_turn = 0
 
         async def should_stop(cursor: Cursor, ev: AgentEvent) -> bool:
-            nonlocal highest_completed_turn
             if cursor.is_child:
                 return False
-            terminal_operator_event = ev.event.type in {
+            if ev.event.type not in {
+                AgentEventType.TURN_END,
                 AgentEventType.OPERATOR_COMMAND_COMPLETED,
                 AgentEventType.OPERATOR_COMMAND_FAILED,
-            }
-            if ev.event.type != AgentEventType.TURN_END and not terminal_operator_event:
-                return False
-            if ev.event.type == AgentEventType.TURN_END:
-                highest_completed_turn = max(highest_completed_turn, ev.turn_number)
-            if cursor.head_offset + 1 < stop_at_root_offset:
+            }:
                 return False
             try:
                 status = await self.get_status()
             except Exception:  # noqa: BLE001 — workflow gone (e.g. failed after an errored turn)
                 return True
+            # Caught up when this terminal event is the last thing the agent published and it
+            # is idle. An activity-published event carries no seq and can never be the last word.
             return (
                 not status.turn_active
                 and not status.pending_turns
-                and highest_completed_turn >= status.current_turn
+                and ev.seq is not None
+                and ev.seq >= status.last_event_seq
             )
 
         merged = merge_stream(
             client=self._temporal,
             root_workflow_id=root_id,
-            root_from_offset=from_offset,
+            root_resume=resume,
             skip_until_turn_id=None,
             select=select_replay,
             should_stop=should_stop,
             stall_grace_seconds=stall_grace_seconds,
         )
-        async for ev, resume_offset in merged:
-            yield on_item(ev, resume_offset)
+        async for ev, point in merged:
+            yield on_item(ev, point)

@@ -17,9 +17,10 @@ import uuid
 import pytest_asyncio
 from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.contrib.workflow_streams import WorkflowStreamClient
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
+
+from tests._streams import turn_events, worker_options, workflow_environment
 
 from temporal_agent_harness.harness.agent_protocol import (
     AGENT_ID_LENGTH,
@@ -47,7 +48,7 @@ from ._subagent_e2e_parent import (
 
 @pytest_asyncio.fixture
 async def client_and_queue():
-    env = await WorkflowEnvironment.start_time_skipping(
+    env = await workflow_environment(
         data_converter=pydantic_data_converter
     )
     task_queue = f"subagent-e2e-{uuid.uuid4()}"
@@ -57,6 +58,7 @@ async def client_and_queue():
     # child workflow.
     async with Worker(
         env.client,
+        **worker_options(),
         task_queue=task_queue,
         workflows=[
             SubagentE2EParentWorkflow,
@@ -101,13 +103,9 @@ async def _drive(
         result_type=AgentMessageReply,
     )
 
-    stream = WorkflowStreamClient.create(client, handle.id)
     reply: str | None = None
     events: list[AgentEvent] = []
-    async for item in stream.subscribe(
-        topics=[TURN_EVENTS_TOPIC], from_offset=0, result_type=AgentEvent
-    ):
-        envelope: AgentEvent = item.data
+    async for envelope in turn_events(client, handle.id):
         events.append(envelope)
         if envelope.event.type == AgentEventType.REPLY:
             reply = envelope.event.output.get("text")
@@ -329,12 +327,8 @@ async def test_operator_command_can_target_live_subagent_directly(client_and_que
     child_client = AgentClient(client, child_workflow_id)
     result = await child_client.execute_operator_command("status")
 
-    stream = WorkflowStreamClient.create(client, child_workflow_id)
     operator_events: list[AgentEvent] = []
-    async for item in stream.subscribe(
-        topics=[TURN_EVENTS_TOPIC], from_offset=0, result_type=AgentEvent
-    ):
-        envelope: AgentEvent = item.data
+    async for envelope in turn_events(client, child_workflow_id):
         if envelope.event.type in {
             AgentEventType.OPERATOR_COMMAND_STARTED,
             AgentEventType.OPERATOR_COMMAND_COMPLETED,
@@ -353,12 +347,9 @@ async def test_operator_command_can_target_live_subagent_directly(client_and_que
 
 
 async def test_attach_after_stopped_subagent_degrades_gracefully(client_and_queue):
-    # The REAL graceful-degradation path (distinct from the LIVE merge above, which reads the
-    # child's detail in real time BEFORE the end-of-turn stop completes the child): here we drive
-    # the subagent and STOP it, so by the time we REATTACH it is a COMPLETED workflow. workflow_streams
-    # cannot read a completed workflow's stream, so the merge cannot mount the stopped child on
-    # replay — it must DEGRADE rather than wedge: release the child's close gate so the parent renders
-    # to its turn_end, and surface a non-fatal subagent_stream_unavailable marker for the child.
+    # Distinct from the LIVE merge above, which reads the child's detail in real time BEFORE the
+    # end-of-turn stop completes the child: here we drive the subagent and STOP it, so by the time
+    # we REATTACH it is a COMPLETED workflow, and the merge mounts its stream after the fact.
     client, task_queue = client_and_queue
     parent_id, _live = await _merged_send(
         client, task_queue, [_const_script(42), _const_script(99)], stop=True
@@ -368,7 +359,7 @@ async def test_attach_after_stopped_subagent_degrades_gracefully(client_and_queu
     agent_client = AgentClient(client, parent_id)
     attached: list[AgentEvent] = []
     async for item in await agent_client.attach(
-        on_item=lambda it, _o: it, from_offset=0, subagent_stall_grace_seconds=2.0
+        on_item=lambda it, _resume: it, subagent_stall_grace_seconds=2.0
     ):
         if isinstance(item, AgentEvent):
             attached.append(item)
@@ -394,14 +385,18 @@ async def test_attach_after_stopped_subagent_degrades_gracefully(client_and_queu
         for e in attached
         if e.event.type == AgentEventType.SUBAGENT_STREAM_UNAVAILABLE
     ]
-    assert markers and all(m.event.subagent_id == child_id for m in markers)
     child_detail = [
         e
         for e in attached
         if e.agent_id == child_id
         and e.event.type != AgentEventType.SUBAGENT_STREAM_UNAVAILABLE
     ]
-    assert not child_detail
+    # Every provider can read a completed workflow's stream (the stores outlive the workflow,
+    # and the Workflow Streams provider serves the final log by Query), so the replay carries
+    # the child's own detail and needs no marker. The give-up path that emits the marker is
+    # exercised against scripted unreadable streams in tests/harness/test_stream_merge.py.
+    assert child_detail
+    assert not markers
 
 
 async def test_gated_concurrent_dispatches_get_distinct_turn_numbers(client_and_queue):
@@ -430,20 +425,17 @@ async def test_gated_concurrent_dispatches_get_distinct_turn_numbers(client_and_
     )
 
     agent_client = AgentClient(client, handle.id)
-    stream = WorkflowStreamClient.create(client, handle.id)
     approved: set[str] = set()
     messaged: list[AgentEvent] = []
-    async for item in stream.subscribe(
-        topics=[TURN_EVENTS_TOPIC], from_offset=0, result_type=AgentEvent
-    ):
-        ev = item.data.event
+    async for envelope in turn_events(client, handle.id):
+        ev = envelope.event
         # Approve each gated send as soon as it asks — independent of arrival order.
         if ev.type == AgentEventType.TOOL_APPROVAL_REQUESTED and ev.tool_id not in approved:
             approved.add(ev.tool_id)
             await agent_client.approve_tool(ev.tool_id, approved=True)
         if ev.type == AgentEventType.SUBAGENT_MESSAGE_SENT:
             messaged.append(ev)
-        if item.data.event.type == AgentEventType.TURN_END:
+        if ev.type == AgentEventType.TURN_END:
             break
 
     assert len(messaged) == 2

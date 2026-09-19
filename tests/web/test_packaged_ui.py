@@ -118,6 +118,22 @@ def test_chat_request_rejects_client_supplied_from_offset() -> None:
     assert any("from_offset" in item.get("loc", []) for item in detail)
 
 
+@pytest.mark.parametrize("resume", ["garbage", "x@7", "some-other-store:3@7"])
+def test_attach_rejects_a_bad_resume_point_before_touching_temporal(resume: str) -> None:
+    app = create_agent_harness_app(registry=AgentRegistry())
+    # The point is refused before any call reaches Temporal, so a bare object stands in for the
+    # client the lifespan would have connected.
+    app.state.temporal = SimpleNamespace()
+    client = TestClient(app)
+
+    response = client.get(
+        "/api/attach", params={"session_id": "agent-session-test", "resume": resume}
+    )
+
+    assert response.status_code == 400
+    assert "invalid resume point" in response.json()["detail"]
+
+
 def test_submit_message_request_rejects_client_supplied_from_offset() -> None:
     app = create_agent_harness_app(registry=AgentRegistry())
     client = TestClient(app)
