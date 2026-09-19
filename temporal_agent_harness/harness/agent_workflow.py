@@ -107,7 +107,10 @@ from temporal_agent_harness.harness.slash_commands import (
 # lives in its own leaf module so the sandbox-safe activity contracts in agent_protocol can embed
 # it without a circular import back through this module.
 from temporal_agent_harness.harness.stream_context import TurnStreamContext
-from temporal_agent_harness.harness.stream_transport import ActivityPublisher, publisher_for_activity
+from temporal_agent_harness.harness.stream_transport import (
+    ActivityPublisher,
+    publisher_for_activity,
+)
 
 # ParamSpec/return-type vars for the tool decorators. They let each be typed as an
 # identity over the wrapped callable (``Callable[P, Awaitable[R]] -> Callable[P,

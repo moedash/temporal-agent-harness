@@ -72,7 +72,9 @@ def _te(agent_id: str, turn: int) -> AgentEvent:
     return _ev(agent_id, turn, TurnEnded())
 
 
-def _ms(agent_id: str, parent_turn: int, *, child: str, child_turn: int, after_cursor: str = "") -> AgentEvent:
+def _ms(
+    agent_id: str, parent_turn: int, *, child: str, child_turn: int, after_cursor: str = ""
+) -> AgentEvent:
     return _ev(
         agent_id,
         parent_turn,
@@ -157,9 +159,9 @@ class _FakeStreams:
         # Streams that BLOCK after exhausting their backlog instead of stopping — mimics a live
         # tail on a still-running workflow. Used to prove unmount-on-subagent_stopped closes it.
         self._live_tail_workflows = live_tail_workflows or set()
-        # workflow_id -> seconds to sleep BEFORE each yielded item — a slow real-time drip. Used to
-        # prove the PER-CHILD stall deadline: a steadily-dripping sibling must NOT keep resetting a
-        # dead child's clock.
+        # workflow_id -> seconds to sleep BEFORE each yielded item — a slow real-time drip. Used
+        # to prove the PER-CHILD stall deadline: a steadily-dripping sibling must NOT keep
+        # resetting a dead child's clock.
         self._drip_workflows = drip_workflows or {}
 
     def follow(
@@ -311,7 +313,9 @@ def test_open_gate_holds_child_until_message_sent_emitted():
     # Child event is held until the parent's message_sent for that turn has been emitted.
     assert not gates.ready(is_child=True, source_workflow_id="C", ev=child_ts)
     mount = gates.on_emit(
-        is_child=False, source_workflow_id="P", ev=_ms("P", 1, child="C", child_turn=1, after_cursor="6")
+        is_child=False,
+        source_workflow_id="P",
+        ev=_ms("P", 1, child="C", child_turn=1, after_cursor="6"),
     )
     # _ms stamps subagent_id = child[:6] ("C"); the mount carries it so a later give-up can label
     # the child even if it delivered no events of its own.
@@ -523,7 +527,8 @@ async def test_send_message_resume_mounts_reused_child_after_cursor():
             _rr("P", 1, child="C", child_turn=1),
             _te("P", 1),
             _ev("P", 2, TurnStarted(user_message="go"), turn_id=target),
-            _ms("P", 2, child="C", child_turn=2, after_cursor="2"),  # C turn 2 begins at child offset 3
+            # C turn 2 begins at child offset 3.
+            _ms("P", 2, child="C", child_turn=2, after_cursor="2"),
             _rr("P", 2, child="C", child_turn=2),
             _ev("P", 2, TurnEnded(), turn_id=target),
         ],

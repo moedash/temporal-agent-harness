@@ -244,12 +244,13 @@ class _Merge:
                 ev_cursor = cur.head_cursor
                 cur.head = None  # consumed → _ensure_pulls re-pulls this cursor next loop
                 # Advance the resume point PAST every ROOT event emitted (any root position is a
-                # safe resume point: ``attach`` resumes with NO skip, and a subagent whose turn began
-                # before the resume point is simply never mounted, its ``reply_received`` released by
-                # the unmounted-stuck give-up). Subagent events leave the point unchanged, so they
-                # all carry the value as of their triggering ``subagent_message_sent``, which means
-                # a reconnect mid a subagent turn forgoes that subagent's remaining detail (lossless
-                # only at root-event granularity; see ``merge_stream``).
+                # safe resume point: ``attach`` resumes with NO skip, and a subagent whose turn
+                # began before the resume point is simply never mounted, its ``reply_received``
+                # released by the unmounted-stuck give-up). Subagent events leave the point
+                # unchanged, so they all carry the value as of their triggering
+                # ``subagent_message_sent``, which means a reconnect mid a subagent turn forgoes
+                # that subagent's remaining detail (lossless only at root-event granularity; see
+                # ``merge_stream``).
                 if not cur.is_child:
                     self._root_resume = self._root_resume.advance(cursor=ev_cursor, seq=ev.seq)
                 yield (ev, self._root_resume)
@@ -496,20 +497,20 @@ async def merge_stream(
     should_stop: ShouldStop,
     stall_grace_seconds: float = DEFAULT_STALL_GRACE_SECONDS,
 ) -> AsyncIterator[MergedItem]:
-    """Drive one gated k-way merge, yielding ``(event, resume_point)`` pairs (see :data:`MergedItem`).
+    """Drive one gated k-way merge, yielding ``(event, resume_point)`` pairs (:data:`MergedItem`).
 
     Mounts ``root_workflow_id`` after ``root_resume.cursor``, then interleaves the root with every
     subagent stream it mounts on a ``subagent_message_sent``, recursively. ``skip_until_turn_id``
     skips the root to a SPECIFIC turn's ``turn_started`` (``send_message``, which must land on the
     submitted turn even if the position it started from is mid a prior turn); ``None`` does no
-    skipping — used by BOTH ``attach`` from the beginning (replay everything) and ``attach`` resuming
-    after a stored point (start exactly there). Resuming mid-stream is safe without skipping: a
-    subagent whose turn began before the resume point is never mounted (we never emit its
-    ``subagent_message_sent``), so its events are absent and its later ``subagent_reply_received``
-    is released by the unmounted-stuck give-up; subagents dispatched at/after the point mount and
-    bracket-merge normally. ``select`` decides the order of genuinely-concurrent events;
-    ``should_stop`` ends the run after a chosen terminal event. Always honors per-stream order and
-    both brackets.
+    skipping — used by BOTH ``attach`` from the beginning (replay everything) and ``attach``
+    resuming after a stored point (start exactly there). Resuming mid-stream is safe without
+    skipping: a subagent whose turn began before the resume point is never mounted (we never emit
+    its ``subagent_message_sent``), so its events are absent and its later
+    ``subagent_reply_received`` is released by the unmounted-stuck give-up; subagents dispatched
+    at/after the point mount and bracket-merge normally. ``select`` decides the order of
+    genuinely-concurrent events; ``should_stop`` ends the run after a chosen terminal event.
+    Always honors per-stream order and both brackets.
 
     A subagent stream that can't be read (a completed/stopped subagent, an over-subscribed
     workflow) or stalls is given up on — its close gate released so the parent flows, and a

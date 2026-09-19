@@ -113,11 +113,11 @@ class CallbackResultError(Exception):
 AgentStreamOutput = AgentEvent | AgentTurnError | AgentTurnTimeout
 
 # The callback signature: (item, resume) -> T
-# ``resume`` is the merge's ROOT-stream resume point as of this item — a value the consumer records
-# (``resume.encode()``) and hands back as ``attach(resume=...)`` to resume. It is NOT the event's own
-# per-stream cursor and NOT a merged display ordinal: it advances only on ROOT events, so every event
-# within one subagent turn carries the same value (the point as of that turn's dispatch). See
-# ``stream_merge.merge.MergedItem``.
+# ``resume`` is the merge's ROOT-stream resume point as of this item — a value the consumer
+# records (``resume.encode()``) and hands back as ``attach(resume=...)`` to resume. It is NOT the
+# event's own per-stream cursor and NOT a merged display ordinal: it advances only on ROOT
+# events, so every event within one subagent turn carries the same value (the point as of that
+# turn's dispatch). See ``stream_merge.merge.MergedItem``.
 OnItemCallback = Callable[[AgentStreamOutput, ResumePoint], T]
 
 

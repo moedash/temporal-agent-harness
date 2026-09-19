@@ -33,8 +33,9 @@ class MountChild:
 
     ``on_emit`` stays pure — it never touches cursors or I/O — so instead of mounting a child
     itself it hands the engine the child ``workflow_id`` to mount and the ``after_cursor`` (on the
-    CHILD's own stream) to resume the new cursor after, both lifted off the ``subagent_message_sent``
-    that opened the bracket. The engine performs the actual (idempotent) mount.
+    CHILD's own stream) to resume the new cursor after, both lifted off the
+    ``subagent_message_sent`` that opened the bracket. The engine performs the actual (idempotent)
+    mount.
 
     ``subagent_id`` (the child's short id, also off the ``subagent_message_sent``) lets the engine
     remember ``workflow_id → subagent_id``, so if it later has to give up on this child it can label

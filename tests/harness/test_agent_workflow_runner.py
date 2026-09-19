@@ -768,7 +768,8 @@ def test_approval_policy_default_is_required():
     is a call-site TypeError — no runtime ``build()`` check to forget. The author must make a
     deliberate safe-by-default approval choice."""
     with pytest.raises(TypeError):
-        AgentWorkflowRunner(AgentConfig())  # type: ignore[call-arg]  — missing approval_policy_default
+        # approval_policy_default is deliberately missing.
+        AgentWorkflowRunner(AgentConfig())  # type: ignore[call-arg]
 
 
 def test_message_queuing_resolves_config_over_agent_default(offline_build):
