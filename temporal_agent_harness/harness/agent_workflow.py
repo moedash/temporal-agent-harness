@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import ast
 import contextvars
 import inspect
@@ -37,8 +36,9 @@ from typing import (
 )
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
-from temporalio import activity, streams, workflow
+from temporalio import activity, workflow
 from temporalio.exceptions import ApplicationError
+from temporalio.streams import StreamProvider
 from temporalio.workflow import ActivityConfig
 
 from temporal_agent_harness.harness.agent_protocol import (
@@ -1245,8 +1245,8 @@ class AgentWorkflowRunner:
                 approval_policy_default=ToolApprovalPolicy.allow_inherently_safe(),
             )
 
-        The runner publishes its events through ``temporalio.streams`` on whichever provider
-        the worker was configured with; the agent names no stream and no store.
+        The runner publishes its events through ``workflow.stream_writer`` on whichever
+        provider the worker was given as a plugin; the agent names no stream and no store.
 
         ``config`` is the standardized agent input; the runner resolves each universal
         knob as *the caller's config value if given, else the agent's default*
@@ -1292,15 +1292,7 @@ class AgentWorkflowRunner:
         # generates its own. workflow.uuid4 is deterministic in-workflow (offline unit tests patch
         # it). Distinct from the full workflow_id, which the model/UI never needs to reproduce.
         self._agent_id: str = config.agent_id or workflow.uuid4().hex[:AGENT_ID_LENGTH]
-        if workflow.in_workflow():
-            # Lets the provider install what it needs before the first task completes. A no-op
-            # except on the transport that serves outside readers through handlers on this
-            # workflow, which an early poller would otherwise find missing.
-            streams.prepare()
-        self._events = streams.writer(TURN_EVENTS_TOPIC, type=AgentEvent)
-        # Envelopes queued by ``_pub`` and drained in order by one task; see ``_pub``.
-        self._outbox: list[AgentEvent] = []
-        self._flush_task: asyncio.Task[None] | None = None
+        self._events = workflow.stream_writer(TURN_EVENTS_TOPIC)
         self._custom_approval_fallback = custom_approval_fallback
         self._status = _WorkflowStatus(
             agent_id=self._agent_id,
@@ -1958,12 +1950,6 @@ class AgentWorkflowRunner:
                 # end-of-turn signal) before looping back to wait for the next message.
                 self._status.complete_turn()
                 self._pub(turn_id, turn_number, TurnEnded())
-                await self._settle_outbox()
-        # Whatever is still queued goes out with this task. Then the provider lets go of what
-        # it parked against this run (the shipped transport holds an outside reader's long
-        # poll here), so the workflow can return without stranding a handler.
-        await self._settle_outbox()
-        streams.drain()
         await workflow.wait_condition(workflow.all_handlers_finished)
 
     async def _dispatch_turn(self, agent: object, envelope: AgentMessage) -> BaseModel:
@@ -2268,6 +2254,7 @@ class AgentWorkflowRunner:
     async def publisher_from_activity(
         context: TurnStreamContext,
         *,
+        provider: StreamProvider | None = None,
         batch_interval: timedelta = timedelta(milliseconds=50),
     ) -> AsyncIterator[TurnEventPublisher]:
         """Open a :class:`TurnEventPublisher` from inside a Temporal activity.
@@ -2286,6 +2273,8 @@ class AgentWorkflowRunner:
                 against. Built on the workflow side via
                 :attr:`AgentWorkflowRunner.current_stream_context` and
                 forwarded opaquely through activity inputs.
+            provider: The stream provider to publish through. Defaults to
+                the one this process built from ``STREAMS_PROVIDER``.
             batch_interval: Background flush cadence on the underlying
                 producer. Default 50ms keeps the UI feel snappy.
 
@@ -2298,7 +2287,7 @@ class AgentWorkflowRunner:
         # not derivable from ``activity.info()`` (which only knows the workflow_id), so it rides
         # in on the threaded ``context`` (TurnStreamContext.agent_id).
         async with publisher_for_activity(
-            TURN_EVENTS_TOPIC, batch_interval=batch_interval
+            TURN_EVENTS_TOPIC, provider=provider, batch_interval=batch_interval
         ) as events:
             yield TurnEventPublisher(events=events, context=context)
 
@@ -2357,7 +2346,7 @@ class AgentWorkflowRunner:
     # -- Internal -----------------------------------------------------------
 
     def _pub(self, turn_id: str, turn_number: int, event: AgentStreamItem) -> None:
-        """Wrap ``event`` in an :class:`AgentEvent` envelope and queue it for publishing."""
+        """Wrap ``event`` in an :class:`AgentEvent` envelope and publish it."""
         envelope = AgentEvent(
             event=event,
             # This agent's own short id — so every event on the stream self-identifies its
@@ -2369,42 +2358,9 @@ class AgentWorkflowRunner:
             timestamp=workflow.time(),
             seq=self._status.next_event_seq(),
         )
-        # The writer's publish awaits its provider (one of them applies back pressure) while
-        # most publish sites here are synchronous, so envelopes queue and one task drains them
-        # in the order they were queued. A drain that failed is left in place: its exception
-        # belongs to whoever settles the outbox next, and a fresh drain would discard it.
-        self._outbox.append(envelope)
-        task = self._flush_task
-        if task is None or (task.done() and not task.cancelled() and task.exception() is None):
-            self._flush_task = self._start_drain()
-
-    def _start_drain(self) -> asyncio.Task[None]:
-        # The workflow sandbox installs its own loop as the running one, so the same call
-        # serves a workflow and a runner built offline in an async test.
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            raise RuntimeError("publishing needs a running event loop") from None
-        return loop.create_task(self._flush_outbox())
-
-    async def _flush_outbox(self) -> None:
-        # Pop only after the publish returned, so an envelope the provider refused stays at the
-        # head rather than vanishing with the exception.
-        while self._outbox:
-            await self._events.publish(self._outbox[0])
-            self._outbox.pop(0)
-
-    async def _settle_outbox(self) -> None:
-        """Wait until the drain has published everything queued.
-
-        The drain runs as its own task, so a publish that raised would otherwise die with it
-        unnoticed. Awaiting it here fails the workflow task instead, and a caller sees the
-        refused envelope still at the head of the outbox.
-        """
-        while self._flush_task is not None and not self._flush_task.done():
-            await self._flush_task
-        if self._flush_task is not None:
-            self._flush_task.result()
+        # The record commits with this Workflow Task. A record the provider cannot stage
+        # raises StreamError here and fails the task, which is the loud outcome we want.
+        self._events.publish(envelope)
 
 
 # ---------------------------------------------------------------------------

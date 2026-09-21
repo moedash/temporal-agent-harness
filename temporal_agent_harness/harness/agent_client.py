@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any, TypeVar
 
 from temporalio.client import Client, WithStartWorkflowOperation, WorkflowUpdateFailedError
+from temporalio.streams import StreamProvider
 
 from temporalio.common import WorkflowIDConflictPolicy
 
@@ -23,6 +24,7 @@ from temporal_agent_harness.harness.agent_protocol import (
     PROVIDE_CALLBACK_RESULT_UPDATE,
     SEND_AGENT_MESSAGE_UPDATE,
     TOOL_APPROVAL_UPDATE,
+    TURN_EVENTS_TOPIC,
     AcceptedFunction,
     AgentConfig,
     AgentEvent,
@@ -48,7 +50,11 @@ from temporal_agent_harness.harness.stream_merge import (
     select_replay,
 )
 from temporal_agent_harness.harness.stream_merge.cursor import Cursor
-from temporal_agent_harness.harness.stream_transport import latest_turn_event, provider_name
+from temporal_agent_harness.harness.stream_transport import (
+    cursor,
+    latest_turn_event,
+    provider_from_env,
+)
 
 # Client default: maximum seconds to wait for a turn to complete.
 DEFAULT_TURN_TIMEOUT = 300.0
@@ -135,15 +141,20 @@ class AgentClient:
     Args:
         temporal: Connected Temporal client.
         workflow_id: ID of the agent workflow to interact with.
+        provider: The stream provider the agent's turn events are read through. Defaults to
+            the one this process built from ``STREAMS_PROVIDER``.
     """
 
     def __init__(
         self,
         temporal: Client,
         workflow_id: str,
+        *,
+        provider: StreamProvider | None = None,
     ) -> None:
         self._temporal = temporal
         self._workflow_id = workflow_id
+        self._provider = provider or provider_from_env()
 
     @property
     def workflow_id(self) -> str:
@@ -461,7 +472,7 @@ class AgentClient:
         # Positioned before submitting, so the turn's first record cannot land before the reader
         # is looking. The workflow does not know where its records land, so the client asks the
         # stream rather than the agent.
-        since = await latest_turn_event(self._temporal, self._workflow_id)
+        since = await latest_turn_event(self._provider, self._temporal, self._workflow_id)
         reply = await self._submit_message(msg_type, payload, expected_turn)
         return self._merged_turn(
             reply,
@@ -499,6 +510,7 @@ class AgentClient:
             )
 
         merged = merge_stream(
+            provider=self._provider,
             client=self._temporal,
             root_workflow_id=self._workflow_id,
             root_resume=ResumePoint(cursor=since),
@@ -590,10 +602,15 @@ class AgentClient:
         This lets a replay that ends with out-of-band operator commands drain them without waiting
         for a nonexistent turn.
 
-        A ``resume`` that is malformed, or that was minted under another stream provider, raises
-        ``ValueError`` before any I/O, so a caller can answer with a client error and start over.
+        A malformed ``resume`` raises ``ValueError`` and one minted under another stream
+        provider raises ``StreamCursorError``, both before anything streams, so a caller can
+        answer with a client error and start over.
         """
-        point = ResumePoint.decode(resume, provider=provider_name())
+        point = ResumePoint.decode(resume)
+        # The provider refuses a foreign token when the read is opened, so opening one here and
+        # closing it unread moves that refusal ahead of the response.
+        handle = self._provider.get_stream_handle(self._temporal, self._workflow_id)
+        await handle.read(topic=TURN_EVENTS_TOPIC, after=cursor(point.cursor)).aclose()
         status = await self.get_status()
         # Already caught up (the point is at or past the agent's last word) and the agent is
         # idle — nothing to stream.
@@ -652,6 +669,7 @@ class AgentClient:
             )
 
         merged = merge_stream(
+            provider=self._provider,
             client=self._temporal,
             root_workflow_id=root_id,
             root_resume=resume,

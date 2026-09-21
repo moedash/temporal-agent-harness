@@ -35,13 +35,13 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import timedelta
 from typing import Any
 
 from pydantic import BaseModel
 from temporalio import activity
 from temporalio.client import Client, WorkflowUpdateFailedError
 from temporalio.exceptions import ApplicationError
+from temporalio.streams import StreamProvider
 
 from temporal_agent_harness.harness.agent_client import (
     AgentBusyError,
@@ -51,7 +51,6 @@ from temporal_agent_harness.harness.agent_client import (
 from temporal_agent_harness.harness.agent_protocol import (
     DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT,
     RUN_SUBAGENT_TURN_ACTIVITY,
-    TURN_EVENTS_TOPIC,
     AgentEvent,
     AgentEventType,
     RunSubagentTurnInput,
@@ -59,7 +58,10 @@ from temporal_agent_harness.harness.agent_protocol import (
     SubagentTurnResult,
 )
 from temporal_agent_harness.harness.agent_workflow import AgentWorkflowRunner
-from temporal_agent_harness.harness.stream_transport import follow_turn_events
+from temporal_agent_harness.harness.stream_transport import (
+    follow_turn_events,
+    provider_from_env,
+)
 
 
 class _TurnProgress(BaseModel):
@@ -82,18 +84,21 @@ class SubagentActivities:
     """Harness activities for driving subagents, bound to a Temporal :class:`Client`.
 
     Construct with the worker's client (closed over so the activity can talk to *child*
-    workflows) and register the bound activity method on the worker::
+    workflows) and the stream provider the worker runs on, and register the bound activity
+    method on the worker::
 
-        subagents = SubagentActivities(client)
-        Worker(..., activities=[subagents.run_subagent_turn, ...])
+        subagents = SubagentActivities(client, provider=provider)
+        Worker(..., activities=[subagents.run_subagent_turn, ...], plugins=[provider])
 
     Kept a class (rather than a module-level client global) so the client is an explicit
     construction dependency; a future harness worker plugin instantiates this from the
-    worker's client automatically.
+    worker's client automatically. ``provider`` defaults to the one this process built from
+    ``STREAMS_PROVIDER``.
     """
 
-    def __init__(self, client: Client) -> None:
+    def __init__(self, client: Client, *, provider: StreamProvider | None = None) -> None:
         self._client = client
+        self._provider = provider or provider_from_env()
 
     @activity.defn(name=RUN_SUBAGENT_TURN_ACTIVITY)
     async def run_subagent_turn(self, req: RunSubagentTurnInput) -> SubagentTurnResult:
@@ -115,7 +120,7 @@ class SubagentActivities:
         * the turn ended in an error (``SubagentTurnError``);
         * the turn ended with no reply (``SubagentNoReply``).
         """
-        client = AgentClient(self._client, req.child_workflow_id)
+        client = AgentClient(self._client, req.child_workflow_id, provider=self._provider)
 
         # "Already sent?" memo: a retry that landed after the send resumes consuming from the
         # heartbeated offset instead of re-submitting the turn. (Best-effort, NOT fully
@@ -179,7 +184,7 @@ class SubagentActivities:
         output: dict[str, Any] = {}
         got_reply = False
         events = follow_turn_events(
-            self._client, req.child_workflow_id, after=progress.consumed_cursor
+            self._provider, self._client, req.child_workflow_id, after=progress.consumed_cursor
         )
         try:
             async for record in events:
@@ -279,9 +284,8 @@ class SubagentActivities:
             consumed_cursor=req.after_cursor,
         )
 
-    @staticmethod
     async def _publish_dispatch(
-        req: RunSubagentTurnInput, progress: _TurnProgress
+        self, req: RunSubagentTurnInput, progress: _TurnProgress
     ) -> None:
         """Publish the :class:`SubagentMessageSent` marker onto the PARENT's stream.
 
@@ -291,7 +295,7 @@ class SubagentActivities:
         stream, never the child's (stream isolation). ``subagent_turn`` is the child's actual
         accepted turn number from the send (``progress.turn_number``)."""
         async with AgentWorkflowRunner.publisher_from_activity(
-            req.parent_stream_context
+            req.parent_stream_context, provider=self._provider
         ) as publisher:
             publisher.publish(
                 SubagentMessageSent(

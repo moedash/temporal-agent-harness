@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 
 from temporalio.client import Client
+from temporalio.streams import StreamProvider
 
 from temporal_agent_harness.harness.agent_protocol import (
     AgentEvent,
@@ -66,35 +67,24 @@ class ResumePoint:
         """The point just past a root record; an activity-published record keeps the last seq."""
         return ResumePoint(cursor=cursor, seq=self.seq if seq is None else seq)
 
-    def encode(self, *, provider: str = "") -> str:
+    def encode(self) -> str:
         """One string for a consumer to store and hand back.
 
-        ``provider`` names the store the cursor belongs to. A point minted under one provider
-        means nothing to another, and stamping it lets ``decode`` refuse the mix-up up front
-        instead of the store choking on a token it cannot parse.
+        The cursor token already names the provider that minted it, so a point handed to
+        another provider is refused by that provider when the read is opened.
         """
         if not (self.cursor or self.seq):
             return ""
-        prefix = f"{provider}:" if provider else ""
-        return f"{prefix}{self.seq}@{self.cursor}"
+        return f"{self.seq}@{self.cursor}"
 
     @classmethod
-    def decode(cls, text: str, *, provider: str = "") -> ResumePoint:
-        """The point ``text`` encodes.
-
-        Raises ``ValueError`` when the text is malformed or stamped with another provider's
-        name. An unstamped point is accepted as is.
-        """
+    def decode(cls, text: str) -> ResumePoint:
+        """The point ``text`` encodes. Raises ``ValueError`` when the text is malformed."""
         if not text:
             return cls()
-        head, sep, cursor = text.partition("@")
+        seq, sep, cursor = text.partition("@")
         if not sep:
             raise ValueError(f"not a resume point: {text!r}")
-        minted_by, _, seq = head.rpartition(":")
-        if minted_by and minted_by != provider:
-            raise ValueError(
-                f"resume point belongs to the {minted_by!r} stream provider, not {provider!r}"
-            )
         try:
             return cls(cursor=cursor, seq=int(seq))
         except ValueError:
@@ -135,11 +125,13 @@ class _Merge:
     def __init__(
         self,
         *,
+        provider: StreamProvider,
         client: Client,
         select: SelectPolicy,
         should_stop: ShouldStop,
         stall_grace_seconds: float = DEFAULT_STALL_GRACE_SECONDS,
     ) -> None:
+        self._provider = provider
         self._client = client
         self._select = select
         self._should_stop = should_stop
@@ -198,6 +190,7 @@ class _Merge:
         else:
             self._root_workflow_id = workflow_id
         self._cursors[workflow_id] = Cursor.mount(
+            self._provider,
             self._client,
             workflow_id=workflow_id,
             is_child=is_child,
@@ -511,6 +504,7 @@ class _Merge:
 
 async def merge_stream(
     *,
+    provider: StreamProvider,
     client: Client,
     root_workflow_id: str,
     root_resume: ResumePoint,
@@ -540,6 +534,7 @@ async def merge_stream(
     recovers). ``stall_grace_seconds`` bounds how long a stalled child may block a buffered parent
     reply before that give-up (a liveness backstop, not an ordering input)."""
     engine = _Merge(
+        provider=provider,
         client=client,
         select=select,
         should_stop=should_stop,

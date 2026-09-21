@@ -11,7 +11,7 @@ import logging
 from collections.abc import AsyncIterator
 
 from temporalio.client import Client
-from temporalio.streams import StreamRecord
+from temporalio.streams import StreamProvider, StreamRecord
 
 from temporal_agent_harness.harness.agent_protocol import AgentEvent, AgentEventType
 from temporal_agent_harness.harness.stream_transport import follow_turn_events
@@ -71,6 +71,7 @@ class Cursor:
     @classmethod
     def mount(
         cls,
+        provider: StreamProvider,
         client: Client,
         *,
         workflow_id: str,
@@ -88,7 +89,7 @@ class Cursor:
             workflow_id=workflow_id,
             is_child=is_child,
             mount_index=mount_index,
-            events=follow_turn_events(client, workflow_id, after=after),
+            events=follow_turn_events(provider, client, workflow_id, after=after),
             skip_until_turn_id=skip_until_turn_id,
         )
 
