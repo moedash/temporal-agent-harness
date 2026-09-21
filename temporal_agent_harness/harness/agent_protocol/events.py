@@ -1,7 +1,7 @@
 # ABOUTME: The agent's workflow-stream event vocabulary — the AgentEventType enum,
 # the typed payload models a producer emits, the AgentStreamItem discriminated union
 # over them, the AgentEvent transport envelope the harness wraps them in, and the
-# ``turn_events`` topic they are published on.
+# ``turn_events`` topic they are published on, as a wire string and as a typed definition.
 #
 # A producer constructs a StreamEvent payload (e.g. ``ReplyDelta(text=…)``) that
 # carries ONLY its ``type`` discriminator and semantic fields — never routing
@@ -17,9 +17,12 @@ from enum import StrEnum
 from typing import Annotated, Any, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from temporalio import streams
 
 # The pubsub topic the agent publishes its turn events on. The workflow must use
-# this exact name when publishing and clients when subscribing.
+# this exact name when publishing and clients when subscribing. The wire and the Nexus
+# adapter's contract carry this string; code that reads or writes the topic passes
+# ``TURN_EVENTS`` (defined at the end of this module), which carries the envelope type too.
 TURN_EVENTS_TOPIC = "turn_events"
 
 
@@ -903,3 +906,8 @@ class AgentEvent(BaseModel):
         description="The wrapped stream-event payload — a discriminated union over ``type`` that "
         "Temporal's Pydantic converter reconstructs to the concrete payload subtype on read."
     )
+
+
+# The turn-events topic as a definition: every context that reads or writes it decodes to
+# ``AgentEvent`` without naming the type again.
+TURN_EVENTS = streams.topic(TURN_EVENTS_TOPIC, AgentEvent)

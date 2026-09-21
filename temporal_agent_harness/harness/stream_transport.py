@@ -22,9 +22,10 @@ from temporalio.streams import (
     StreamProducer,
     StreamProvider,
     StreamRecord,
+    StreamTopic,
 )
 
-from temporal_agent_harness.harness.agent_protocol import TURN_EVENTS_TOPIC, AgentEvent
+from temporal_agent_harness.harness.agent_protocol import TURN_EVENTS, AgentEvent
 
 PROVIDER_ENV = "STREAMS_PROVIDER"
 DEFAULT_PROVIDER = "workflow_streams"
@@ -85,7 +86,7 @@ async def latest_turn_event(client: Client, workflow_id: str) -> str:
     stream provider as a plugin.
     """
     handle = client.get_stream_handle(workflow_id)
-    return (await handle.latest(topic=TURN_EVENTS_TOPIC)).token
+    return (await handle.latest(topic=TURN_EVENTS)).token
 
 
 def follow_turn_events(
@@ -101,7 +102,7 @@ def follow_turn_events(
     ``client`` carries the stream provider as a plugin.
     """
     handle = client.get_stream_handle(workflow_id)
-    records = handle.read(topic=TURN_EVENTS_TOPIC, after=cursor(after), result_type=AgentEvent)
+    records = handle.read(topic=TURN_EVENTS, after=cursor(after))
     return _data_records(records)
 
 
@@ -169,7 +170,7 @@ class ActivityPublisher:
 
 @asynccontextmanager
 async def publisher_for_activity(
-    topic: str, *, batch_interval: timedelta = timedelta(milliseconds=50)
+    topic: str | StreamTopic[Any], *, batch_interval: timedelta = timedelta(milliseconds=50)
 ) -> AsyncIterator[ActivityPublisher]:
     """A batched publisher onto ``topic`` of the stream this activity's workflow publishes.
 

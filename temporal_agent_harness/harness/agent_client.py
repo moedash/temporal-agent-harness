@@ -23,7 +23,7 @@ from temporal_agent_harness.harness.agent_protocol import (
     PROVIDE_CALLBACK_RESULT_UPDATE,
     SEND_AGENT_MESSAGE_UPDATE,
     TOOL_APPROVAL_UPDATE,
-    TURN_EVENTS_TOPIC,
+    TURN_EVENTS,
     AcceptedFunction,
     AgentConfig,
     AgentEvent,
@@ -600,7 +600,7 @@ class AgentClient:
         # The provider refuses a foreign token when the read is opened, so opening one here and
         # closing it unread moves that refusal ahead of the response.
         handle = self._temporal.get_stream_handle(self._workflow_id)
-        await handle.read(topic=TURN_EVENTS_TOPIC, after=cursor(point.cursor)).aclose()
+        await handle.read(topic=TURN_EVENTS, after=cursor(point.cursor)).aclose()
         status = await self.get_status()
         # Already caught up (the point is at or past the agent's last word) and the agent is
         # idle — nothing to stream.

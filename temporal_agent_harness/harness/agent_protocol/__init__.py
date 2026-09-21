@@ -40,6 +40,7 @@ from temporal_agent_harness.harness.agent_protocol.agent_interface import (
     AgentMessageReply,
 )
 from temporal_agent_harness.harness.agent_protocol.events import (
+    TURN_EVENTS,
     TURN_EVENTS_TOPIC,
     AgentError,
     AgentEvent,
@@ -120,6 +121,7 @@ __all__ = [
     "ToolApprovalResult",
     "AgentMessageReply",
     # Stream-event vocabulary
+    "TURN_EVENTS",
     "TURN_EVENTS_TOPIC",
     "AgentEventType",
     "EventTypeT",

@@ -9,6 +9,11 @@ from typing import Any
 
 import pytest
 
+from temporal_agent_harness.harness.agent_protocol import (
+    TURN_EVENTS,
+    TURN_EVENTS_TOPIC,
+    AgentEvent,
+)
 from temporal_agent_harness.harness.stream_transport import ActivityPublisher
 
 
@@ -50,3 +55,9 @@ async def test_publish_after_exit_is_refused():
     with pytest.raises(RuntimeError):
         publisher.publish("late")
     assert producer.appended == []
+
+
+def test_turn_events_definition_names_the_wire_topic():
+    """The typed definition and the wire string are one topic, decoding to the envelope."""
+    assert TURN_EVENTS.name == TURN_EVENTS_TOPIC
+    assert TURN_EVENTS.result_type is AgentEvent

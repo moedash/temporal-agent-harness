@@ -52,7 +52,7 @@ from temporal_agent_harness.harness.agent_protocol import (
     RUN_SUBAGENT_TURN_ACTIVITY,
     SEND_AGENT_MESSAGE_UPDATE,
     TOOL_APPROVAL_UPDATE,
-    TURN_EVENTS_TOPIC,
+    TURN_EVENTS,
     AcceptedFunction,
     AgentConfig,
     AgentError,
@@ -1291,7 +1291,7 @@ class AgentWorkflowRunner:
         # generates its own. workflow.uuid4 is deterministic in-workflow (offline unit tests patch
         # it). Distinct from the full workflow_id, which the model/UI never needs to reproduce.
         self._agent_id: str = config.agent_id or workflow.uuid4().hex[:AGENT_ID_LENGTH]
-        self._events = workflow.stream_writer(TURN_EVENTS_TOPIC)
+        self._events = workflow.stream_writer(TURN_EVENTS)
         self._custom_approval_fallback = custom_approval_fallback
         self._status = _WorkflowStatus(
             agent_id=self._agent_id,
@@ -2283,7 +2283,7 @@ class AgentWorkflowRunner:
         # not derivable from ``activity.info()`` (which only knows the workflow_id), so it rides
         # in on the threaded ``context`` (TurnStreamContext.agent_id).
         async with publisher_for_activity(
-            TURN_EVENTS_TOPIC, batch_interval=batch_interval
+            TURN_EVENTS, batch_interval=batch_interval
         ) as events:
             yield TurnEventPublisher(events=events, context=context)
 
