@@ -397,9 +397,14 @@ pydantic_ai_hello) and/or `GEMINI_API_KEY` (monty, wiki, coding). The default co
 
 ### Choosing the stream provider
 
-Agents publish their turn events through `temporalio.streams`, and the store behind it is a
-per-process choice made from the environment. Workers, the web app, and the Nexus adapter all read
-`STREAMS_PROVIDER` at startup; agent code names nothing.
+Agents publish their turn events through `workflow.stream_writer`, and the store behind it is a
+per-process choice made from the environment. `provider_from_env()` in
+`temporal_agent_harness.harness.stream_transport` builds the provider `STREAMS_PROVIDER` names. A
+worker passes it as a plugin, `Worker(..., plugins=[provider])`, which is how the workflow's
+writer and the activities' producers find the store. A process outside a worker, such as the web
+app or the Nexus adapter, holds the same object and asks it for a stream handle,
+`provider.get_stream_handle(client, workflow_id)`, to read the turn events. Agent code names
+nothing.
 
 | `STREAMS_PROVIDER` | Where events live | Needs |
 |---|---|---|
@@ -419,8 +424,9 @@ What the choice costs, beyond the table:
 - On `native`, a workflow's own publish rides its Workflow Task and costs nothing extra. A publish
   from an activity costs one transition on the agent's execution per batch, which is why the
   activity-side publisher buffers.
-- `native` and `redis` store the framed value as is. It goes through the payload converter, so
-  typed decode works, but not through the codec chain, so nothing encrypts or compresses it.
+- Every provider stores the record as the `temporal.api.stream.v1.StreamRecord` proto with the
+  value as an ordinary payload, so the payload converter and the client's codec chain both apply
+  to it.
 
 Not checked yet on `native`: Cassandra, so nothing here says what streams cost on it, and a
 workflow that was terminated rather than completed while a reader was tailing it.
