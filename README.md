@@ -399,11 +399,12 @@ pydantic_ai_hello) and/or `GEMINI_API_KEY` (monty, wiki, coding). The default co
 
 Agents publish their turn events through `workflow.stream_writer`, and the store behind it is a
 per-process choice made from the environment. `provider_from_env()` in
-`temporal_agent_harness.harness.stream_transport` builds the provider `STREAMS_PROVIDER` names. A
-worker passes it as a plugin, `Worker(..., plugins=[provider])`, which is how the workflow's
-writer and the activities' producers find the store. A process outside a worker, such as the web
-app or the Nexus adapter, holds the same object and asks it for a stream handle,
-`provider.get_stream_handle(client, workflow_id)`, to read the turn events. Agent code names
+`temporal_agent_harness.harness.stream_transport` builds the provider `STREAMS_PROVIDER` names,
+and the process registers it once on its client, `Client.connect(..., plugins=[provider])`.
+Workers built from that client inherit it, so the workflow's writer and the activities'
+producers find the store without being told; an activity asks `activity.stream_handle()`. A
+process outside a worker, such as the web app or the Nexus adapter, reads the turn events
+through `client.get_stream_handle(workflow_id)` on the same kind of client. Agent code names
 nothing.
 
 | `STREAMS_PROVIDER` | Where events live | Needs |
