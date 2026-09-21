@@ -55,9 +55,9 @@ async def main() -> None:
 
     # PydanticAIPlugin supplies the Pydantic-compatible data converter + sandbox passthroughs.
     connect_config = ClientConfig.load_client_connect_config()
-    client = await Client.connect(**connect_config, plugins=[PydanticAIPlugin()])
-
     provider = provider_from_env()
+    client = await Client.connect(**connect_config, plugins=[PydanticAIPlugin(), provider])
+
     worker = Worker(
         client,
         task_queue=task_queue,
@@ -65,7 +65,7 @@ async def main() -> None:
         # No harness tool activities: get_weather is an inline workflow tool. The durable agent's
         # activities are registered by AgentPlugin.
         activities=[],
-        plugins=[provider, AgentPlugin(_TEMPORAL_AGENT)],
+        plugins=[AgentPlugin(_TEMPORAL_AGENT)],
     )
     print(
         f"Pydantic AI hello agent worker ready: "

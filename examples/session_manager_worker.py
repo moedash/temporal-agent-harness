@@ -20,6 +20,7 @@ from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.envconfig import ClientConfig
 
+from temporal_agent_harness.harness.stream_transport import provider_from_env
 from temporal_agent_harness.utils.large_payload import with_large_payload_offload
 from temporal_agent_harness.web import (
     SESSION_MANAGER_TASK_QUEUE,
@@ -38,6 +39,7 @@ async def main() -> None:
     client = await Client.connect(
         **connect_config,
         data_converter=await with_large_payload_offload(pydantic_data_converter),
+        plugins=[provider_from_env()],
     )
 
     worker = create_session_manager_worker(client)

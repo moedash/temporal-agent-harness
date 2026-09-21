@@ -15,7 +15,6 @@ from nexusrpc import HandlerError, HandlerErrorType
 from nexusrpc.handler import StartOperationContext, service_handler, sync_operation
 from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.service import RPCError
-from temporalio.streams import StreamProvider
 
 from temporal_agent_harness.harness.agent_client import (
     AgentClient,
@@ -32,10 +31,7 @@ from temporal_agent_harness.harness.agent_protocol import (
     SubagentInfo,
     ToolApprovalPolicy,
 )
-from temporal_agent_harness.harness.stream_transport import (
-    follow_turn_events,
-    provider_from_env,
-)
+from temporal_agent_harness.harness.stream_transport import follow_turn_events
 
 # Aliased with a Nexus* prefix where the name collides with an agent_protocol type of the
 # same name but a different (reshaped, wire-friendly) shape.
@@ -152,26 +148,20 @@ class AgentServiceHandler:
     """Exposes an agent session to external callers (e.g. the Slack connector).
 
     The connector calls ``sendAgentMessage`` to deliver user input and ``pollMessages`` to
-    consume the agent's response stream. ``provider`` is the stream provider the agents'
-    turn events are read through; it defaults to the one this process built from
-    ``STREAMS_PROVIDER``.
+    consume the agent's response stream. ``client`` carries the stream provider the agents'
+    turn events are read through as a plugin.
     """
 
-    def __init__(
-        self, client: Client, config: Config, *, provider: StreamProvider | None = None
-    ) -> None:
+    def __init__(self, client: Client, config: Config) -> None:
         self._client = client
         self._config = config
-        self._provider = provider or provider_from_env()
 
     def _workflow_id(self, session_id: str) -> str:
         return self._config.workflow_id_prefix + session_id
 
     def _agent_client(self, session_id: str) -> AgentClient:
         """Cheap to construct per-call. Every operation but pollMessages delegates to it."""
-        return AgentClient(
-            self._client, self._workflow_id(session_id), provider=self._provider
-        )
+        return AgentClient(self._client, self._workflow_id(session_id))
 
     # -----------------------------------------------------------------------
     # sendAgentMessage — AgentClient.start_and_submit_message()'s guess-and-retry caller
@@ -364,7 +354,7 @@ class AgentServiceHandler:
         cursor = input.cursor
         closed = False
         more_ready = False
-        events = follow_turn_events(self._provider, self._client, workflow_id, after=cursor)
+        events = follow_turn_events(self._client, workflow_id, after=cursor)
         try:
             async with asyncio.timeout(timeout) as window:
                 async for record in events:

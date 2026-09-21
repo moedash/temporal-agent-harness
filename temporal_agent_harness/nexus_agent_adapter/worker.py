@@ -44,6 +44,7 @@ async def main() -> None:
         address,
         namespace=agent_namespace,
         data_converter=pydantic_data_converter,
+        plugins=[provider_from_env()],
     )
 
     config = Config(
@@ -52,12 +53,10 @@ async def main() -> None:
         workflow_id_prefix=workflow_id_prefix,
         is_message_queuing_enabled=True,
     )
-    provider = provider_from_env()
     worker = Worker(
         client,
         task_queue=nexus_task_queue,
-        nexus_service_handlers=[AgentServiceHandler(client, config, provider=provider)],
-        plugins=[provider],
+        nexus_service_handlers=[AgentServiceHandler(client, config)],
     )
 
     logger.info(

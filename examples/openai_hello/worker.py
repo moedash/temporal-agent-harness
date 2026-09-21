@@ -72,12 +72,11 @@ async def main() -> None:
 
     # The plugin supplies its own (OpenAI-aware, pydantic-compatible) data converter.
     connect_config = ClientConfig.load_client_connect_config()
-    client = await Client.connect(**connect_config, plugins=[plugin])
-
     provider = provider_from_env()
+    client = await Client.connect(**connect_config, plugins=[plugin, provider])
+
     worker = Worker(
         client,
-        plugins=[provider],
         task_queue=task_queue,
         workflows=[OpenAIHelloAgentWorkflow],
         # No tool activities: get_weather is an inline workflow tool. The OpenAI model

@@ -57,16 +57,15 @@ async def main() -> None:
     # Match the session-manager worker + server converter (large-payload offload) so every
     # process reads the same payloads.
     connect_config = ClientConfig.load_client_connect_config()
+    provider = provider_from_env()
     client = await Client.connect(
         **connect_config,
-        plugins=[plugin],
+        plugins=[plugin, provider],
         data_converter=await with_large_payload_offload(pydantic_data_converter),
     )
 
-    provider = provider_from_env()
     worker = Worker(
         client,
-        plugins=[provider],
         task_queue=task_queue,
         workflows=[CodingAgentWorkflow],
         # No tool activities: the coding tools are callback tools fulfilled by the shim. The

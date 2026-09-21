@@ -79,9 +79,10 @@ async def main() -> None:
     plugin = GoogleGenAIPlugin(GeminiClient(api_key=api_key))
 
     connect_config = ClientConfig.load_client_connect_config()
+    provider = provider_from_env()
     client = await Client.connect(
         **connect_config,
-        plugins=[plugin],
+        plugins=[plugin, provider],
         data_converter=await with_large_payload_offload(pydantic_data_converter),
     )
 
@@ -94,11 +95,9 @@ async def main() -> None:
     # SubagentActivities closes over this worker's client so its run_subagent_turn activity can
     # send updates to + stream the reply from the child MontyDynamicAgent workflow. It's the
     # activity the subagent toolset's monty_run_script tool dispatches each turn.
-    provider = provider_from_env()
-    subagents = SubagentActivities(client, provider=provider)
+    subagents = SubagentActivities(client)
     worker = Worker(
         client,
-        plugins=[provider],
         task_queue=task_queue,
         workflows=[
             MontyDynamicAgentWorkflow,
