@@ -32,7 +32,7 @@ from temporalio.client import Client
 from temporalio.envconfig import ClientConfig
 from temporalio.worker import Worker
 
-from temporal_agent_harness.harness.stream_transport import configure_from_env, worker_options
+from temporal_agent_harness.harness.stream_transport import provider_from_env
 
 from temporal_agent_harness.ai_sdks.openai_agents import (
     ModelActivityParameters,
@@ -74,10 +74,10 @@ async def main() -> None:
     connect_config = ClientConfig.load_client_connect_config()
     client = await Client.connect(**connect_config, plugins=[plugin])
 
-    configure_from_env()
+    provider = provider_from_env()
     worker = Worker(
         client,
-        **worker_options(),
+        plugins=[provider],
         task_queue=task_queue,
         workflows=[OpenAIHelloAgentWorkflow],
         # No tool activities: get_weather is an inline workflow tool. The OpenAI model

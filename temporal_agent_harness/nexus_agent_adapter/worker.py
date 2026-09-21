@@ -17,7 +17,7 @@ from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Worker
 
-from temporal_agent_harness.harness.stream_transport import configure_from_env, worker_options
+from temporal_agent_harness.harness.stream_transport import provider_from_env
 
 from .handler import AgentServiceHandler, Config
 
@@ -52,12 +52,12 @@ async def main() -> None:
         workflow_id_prefix=workflow_id_prefix,
         is_message_queuing_enabled=True,
     )
-    configure_from_env()
+    provider = provider_from_env()
     worker = Worker(
         client,
-        **worker_options(),
         task_queue=nexus_task_queue,
-        nexus_service_handlers=[AgentServiceHandler(client, config)],
+        nexus_service_handlers=[AgentServiceHandler(client, config, provider=provider)],
+        plugins=[provider],
     )
 
     logger.info(

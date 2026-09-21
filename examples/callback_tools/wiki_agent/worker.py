@@ -30,7 +30,7 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.envconfig import ClientConfig
 from temporalio.worker import Worker
 
-from temporal_agent_harness.harness.stream_transport import configure_from_env, worker_options
+from temporal_agent_harness.harness.stream_transport import provider_from_env
 
 from temporal_agent_harness.ai_sdks.google_genai_plugin import GoogleGenAIPlugin
 from temporal_agent_harness.utils.large_payload import with_large_payload_offload
@@ -63,10 +63,10 @@ async def main() -> None:
         data_converter=await with_large_payload_offload(pydantic_data_converter),
     )
 
-    configure_from_env()
+    provider = provider_from_env()
     worker = Worker(
         client,
-        **worker_options(),
+        plugins=[provider],
         task_queue=task_queue,
         workflows=[WikiAgentWorkflow],
         # No tool activities: the wiki tools are callback tools fulfilled by the client. The
