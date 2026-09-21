@@ -12,7 +12,6 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any, TypeVar
 
 from temporalio.client import Client, WithStartWorkflowOperation, WorkflowUpdateFailedError
-from temporalio.streams import StreamProvider
 
 from temporalio.common import WorkflowIDConflictPolicy
 
@@ -50,11 +49,7 @@ from temporal_agent_harness.harness.stream_merge import (
     select_replay,
 )
 from temporal_agent_harness.harness.stream_merge.cursor import Cursor
-from temporal_agent_harness.harness.stream_transport import (
-    cursor,
-    latest_turn_event,
-    provider_from_env,
-)
+from temporal_agent_harness.harness.stream_transport import cursor, latest_turn_event
 
 # Client default: maximum seconds to wait for a turn to complete.
 DEFAULT_TURN_TIMEOUT = 300.0
@@ -139,22 +134,18 @@ class AgentClient:
     stream log). This client is cheap to construct per-request.
 
     Args:
-        temporal: Connected Temporal client.
+        temporal: Connected Temporal client, with the stream provider the agent's turn
+            events are read through registered on it as a plugin.
         workflow_id: ID of the agent workflow to interact with.
-        provider: The stream provider the agent's turn events are read through. Defaults to
-            the one this process built from ``STREAMS_PROVIDER``.
     """
 
     def __init__(
         self,
         temporal: Client,
         workflow_id: str,
-        *,
-        provider: StreamProvider | None = None,
     ) -> None:
         self._temporal = temporal
         self._workflow_id = workflow_id
-        self._provider = provider or provider_from_env()
 
     @property
     def workflow_id(self) -> str:
@@ -472,7 +463,7 @@ class AgentClient:
         # Positioned before submitting, so the turn's first record cannot land before the reader
         # is looking. The workflow does not know where its records land, so the client asks the
         # stream rather than the agent.
-        since = await latest_turn_event(self._provider, self._temporal, self._workflow_id)
+        since = await latest_turn_event(self._temporal, self._workflow_id)
         reply = await self._submit_message(msg_type, payload, expected_turn)
         return self._merged_turn(
             reply,
@@ -510,7 +501,6 @@ class AgentClient:
             )
 
         merged = merge_stream(
-            provider=self._provider,
             client=self._temporal,
             root_workflow_id=self._workflow_id,
             root_resume=ResumePoint(cursor=since),
@@ -609,7 +599,7 @@ class AgentClient:
         point = ResumePoint.decode(resume)
         # The provider refuses a foreign token when the read is opened, so opening one here and
         # closing it unread moves that refusal ahead of the response.
-        handle = self._provider.get_stream_handle(self._temporal, self._workflow_id)
+        handle = self._temporal.get_stream_handle(self._workflow_id)
         await handle.read(topic=TURN_EVENTS_TOPIC, after=cursor(point.cursor)).aclose()
         status = await self.get_status()
         # Already caught up (the point is at or past the agent's last word) and the agent is
@@ -669,7 +659,6 @@ class AgentClient:
             )
 
         merged = merge_stream(
-            provider=self._provider,
             client=self._temporal,
             root_workflow_id=root_id,
             root_resume=resume,

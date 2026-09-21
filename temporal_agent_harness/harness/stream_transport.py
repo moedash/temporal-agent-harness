@@ -1,6 +1,8 @@
 # ABOUTME: How the harness reaches its streams: the one place a provider is named, the batched
 # publisher an activity uses, and the readers every client-side consumer of turn events shares.
-# Workflow code publishes through ``workflow.stream_writer`` and never names a store.
+# The provider is registered once on the client; every context then asks for its stream the
+# same way, and workflow code publishes through ``workflow.stream_writer`` and never names a
+# store.
 
 from __future__ import annotations
 
@@ -27,8 +29,6 @@ from temporal_agent_harness.harness.agent_protocol import TURN_EVENTS_TOPIC, Age
 PROVIDER_ENV = "STREAMS_PROVIDER"
 DEFAULT_PROVIDER = "workflow_streams"
 
-_process_provider: StreamProvider | None = None
-
 
 def provider_name() -> str:
     """The provider this process names, read from ``STREAMS_PROVIDER``."""
@@ -36,7 +36,7 @@ def provider_name() -> str:
 
 
 def provider_from_env() -> StreamProvider:
-    """The stream provider ``STREAMS_PROVIDER`` names, built once per process.
+    """A stream provider built from ``STREAMS_PROVIDER``.
 
     ``workflow_streams`` (today's Workflow Streams, nothing to run) is the default. ``redis``
     reads ``AI198_REDIS_URL``; ``native`` needs a Temporal server that carries streams;
@@ -44,30 +44,13 @@ def provider_from_env() -> StreamProvider:
     offered: it needs an endpoint name and an HTTP address the harness has no settings for,
     and it cannot serve a worker.
 
-    A worker passes the result as ``Worker(plugins=[provider])``; everything else opens
-    handles from it. The first call builds the provider and later calls return the same
-    instance: an activity has no runtime to ask its worker for the provider, and the memory
-    provider shares nothing between two instances.
+    Register the result once, as ``Client.connect(..., plugins=[provider])``. Workers built
+    from that client inherit it, an activity reaches it through ``activity.stream_handle()``
+    and any other code through ``client.get_stream_handle()``. Two providers share nothing,
+    so a process that needs the same store in two places hands the same object to both.
+    Close it with ``provider.close()`` when the process is done.
     """
-    global _process_provider
-    if _process_provider is None:
-        _process_provider = _build(provider_name())
-    return _process_provider
-
-
-async def close_provider() -> None:
-    """Close the provider this process built, if any; the next call builds a new one.
-
-    For a process that is done, and for a test suite that gives every test its own event
-    loop, which a provider holding connections cannot outlive.
-    """
-    global _process_provider
-    provider, _process_provider = _process_provider, None
-    if provider is not None:
-        await provider.close()
-
-
-def _build(name: str) -> StreamProvider:
+    name = provider_name()
     if name == "workflow_streams":
         from temporalio.streams.providers.workflow_streams import WorkflowStreamsProvider
 
@@ -94,18 +77,19 @@ def cursor(token: str) -> Cursor:
     return Cursor(token) if token else BEGINNING
 
 
-async def latest_turn_event(provider: StreamProvider, client: Client, workflow_id: str) -> str:
+async def latest_turn_event(client: Client, workflow_id: str) -> str:
     """The token of ``workflow_id``'s newest turn event, or empty when it has none.
 
     A client about to send a message reads this first, then follows the stream after it, so
-    it sees the turn it started without replaying the agent's history.
+    it sees the turn it started without replaying the agent's history. ``client`` carries the
+    stream provider as a plugin.
     """
-    handle = provider.get_stream_handle(client, workflow_id)
+    handle = client.get_stream_handle(workflow_id)
     return (await handle.latest(topic=TURN_EVENTS_TOPIC)).token
 
 
 def follow_turn_events(
-    provider: StreamProvider, client: Client, workflow_id: str, *, after: str = ""
+    client: Client, workflow_id: str, *, after: str = ""
 ) -> AsyncGenerator[StreamRecord[AgentEvent], None]:
     """Yield ``workflow_id``'s turn events after the record ``after`` names, then tail live.
 
@@ -114,8 +98,9 @@ def follow_turn_events(
     cursor to store for a later ``after``. A token another provider minted is refused by this
     call with ``StreamCursorError``, before anything is read. Closing the generator closes the
     subscription, which matters on the transport that parks a long poll against the workflow.
+    ``client`` carries the stream provider as a plugin.
     """
-    handle = provider.get_stream_handle(client, workflow_id)
+    handle = client.get_stream_handle(workflow_id)
     records = handle.read(topic=TURN_EVENTS_TOPIC, after=cursor(after), result_type=AgentEvent)
     return _data_records(records)
 
@@ -184,21 +169,16 @@ class ActivityPublisher:
 
 @asynccontextmanager
 async def publisher_for_activity(
-    topic: str,
-    *,
-    provider: StreamProvider | None = None,
-    batch_interval: timedelta = timedelta(milliseconds=50),
+    topic: str, *, batch_interval: timedelta = timedelta(milliseconds=50)
 ) -> AsyncIterator[ActivityPublisher]:
     """A batched publisher onto ``topic`` of the stream this activity's workflow publishes.
 
-    The producer carries the activity's own id and attempt, so a retry's records deduplicate
-    and a new attempt is reported to readers as a supersession, and the records land next
-    to the workflow's own for whoever follows the topic. ``provider`` defaults to the one
-    this process built from the environment.
+    The handle is this activity's own workflow, pinned to its run, through the provider the
+    worker inherited from its client. The producer carries the activity's own id and attempt,
+    so a retry's records deduplicate and a new attempt is reported to readers as a
+    supersession, and the records land next to the workflow's own for whoever follows the
+    topic.
     """
-    handle = (provider or provider_from_env()).get_stream_handle(
-        activity.client(), activity.info().workflow_id
-    )
-    producer = handle.producer(topic=topic)
+    producer = activity.stream_handle().producer(topic=topic)
     async with ActivityPublisher(producer, batch_interval=batch_interval) as publisher:
         yield publisher

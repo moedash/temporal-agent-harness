@@ -38,7 +38,6 @@ from typing import (
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from temporalio import activity, workflow
 from temporalio.exceptions import ApplicationError
-from temporalio.streams import StreamProvider
 from temporalio.workflow import ActivityConfig
 
 from temporal_agent_harness.harness.agent_protocol import (
@@ -2254,7 +2253,6 @@ class AgentWorkflowRunner:
     async def publisher_from_activity(
         context: TurnStreamContext,
         *,
-        provider: StreamProvider | None = None,
         batch_interval: timedelta = timedelta(milliseconds=50),
     ) -> AsyncIterator[TurnEventPublisher]:
         """Open a :class:`TurnEventPublisher` from inside a Temporal activity.
@@ -2273,8 +2271,6 @@ class AgentWorkflowRunner:
                 against. Built on the workflow side via
                 :attr:`AgentWorkflowRunner.current_stream_context` and
                 forwarded opaquely through activity inputs.
-            provider: The stream provider to publish through. Defaults to
-                the one this process built from ``STREAMS_PROVIDER``.
             batch_interval: Background flush cadence on the underlying
                 producer. Default 50ms keeps the UI feel snappy.
 
@@ -2287,7 +2283,7 @@ class AgentWorkflowRunner:
         # not derivable from ``activity.info()`` (which only knows the workflow_id), so it rides
         # in on the threaded ``context`` (TurnStreamContext.agent_id).
         async with publisher_for_activity(
-            TURN_EVENTS_TOPIC, provider=provider, batch_interval=batch_interval
+            TURN_EVENTS_TOPIC, batch_interval=batch_interval
         ) as events:
             yield TurnEventPublisher(events=events, context=context)
 

@@ -13,7 +13,6 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 
 from temporalio.client import Client
-from temporalio.streams import StreamProvider
 
 from temporal_agent_harness.harness.agent_protocol import (
     AgentEvent,
@@ -125,13 +124,11 @@ class _Merge:
     def __init__(
         self,
         *,
-        provider: StreamProvider,
         client: Client,
         select: SelectPolicy,
         should_stop: ShouldStop,
         stall_grace_seconds: float = DEFAULT_STALL_GRACE_SECONDS,
     ) -> None:
-        self._provider = provider
         self._client = client
         self._select = select
         self._should_stop = should_stop
@@ -190,7 +187,6 @@ class _Merge:
         else:
             self._root_workflow_id = workflow_id
         self._cursors[workflow_id] = Cursor.mount(
-            self._provider,
             self._client,
             workflow_id=workflow_id,
             is_child=is_child,
@@ -504,7 +500,6 @@ class _Merge:
 
 async def merge_stream(
     *,
-    provider: StreamProvider,
     client: Client,
     root_workflow_id: str,
     root_resume: ResumePoint,
@@ -534,7 +529,6 @@ async def merge_stream(
     recovers). ``stall_grace_seconds`` bounds how long a stalled child may block a buffered parent
     reply before that give-up (a liveness backstop, not an ordering input)."""
     engine = _Merge(
-        provider=provider,
         client=client,
         select=select,
         should_stop=should_stop,
