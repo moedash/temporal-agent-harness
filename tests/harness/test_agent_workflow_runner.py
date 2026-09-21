@@ -27,10 +27,9 @@ from temporalio import workflow
 from temporalio.client import Client, WorkflowHandle, WorkflowUpdateFailedError
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.streams import StreamCursorError
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
-from tests._streams import provider, turn_events, workflow_environment
+from tests._streams import turn_events, workflow_environment
 
 from temporal_agent_harness.harness import AgentWorkflowRunner, agent, slash_commands
 from temporal_agent_harness.harness.agent_protocol import (
@@ -192,7 +191,6 @@ async def client_and_queue():
     task_queue = f"agent-workflow-runner-test-{uuid.uuid4()}"
     async with Worker(
         env.client,
-        plugins=[provider()],
         task_queue=task_queue,
         workflows=[TypedProbeAgent, SlashExtensionProbeAgent],
         # Unsandboxed so the test module's imports (pydantic, harness, pytest) don't
@@ -480,7 +478,7 @@ async def test_attach_refuses_a_foreign_resume_point_before_streaming(client_and
     can answer with a client error instead of failing after the response started."""
     client, task_queue = client_and_queue
     handle = await _start(client, task_queue, TypedProbeAgent)
-    agent_client = AgentClient(client, handle.id, provider=provider())
+    agent_client = AgentClient(client, handle.id)
 
     with pytest.raises(StreamCursorError):
         await agent_client.attach(on_item=lambda item, _resume: item, resume="1@foreign:0")

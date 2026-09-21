@@ -121,10 +121,9 @@ def test_chat_request_rejects_client_supplied_from_offset() -> None:
 @pytest.mark.parametrize("resume", ["garbage", "x@7", "@7"])
 def test_attach_rejects_a_bad_resume_point_before_touching_temporal(resume: str) -> None:
     app = create_agent_harness_app(registry=AgentRegistry())
-    # The point is refused before any call reaches Temporal or the store, so bare objects stand
-    # in for the client and the provider the lifespan would have built.
+    # The point is refused before any call reaches Temporal or the store, so a bare object stands
+    # in for the client the lifespan would have connected.
     app.state.temporal = SimpleNamespace()
-    app.state.stream_provider = SimpleNamespace()
     client = TestClient(app)
 
     response = client.get(

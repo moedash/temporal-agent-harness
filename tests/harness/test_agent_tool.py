@@ -13,21 +13,18 @@
 from __future__ import annotations
 
 import uuid
-from datetime import timedelta
 
 import pytest_asyncio
 from temporalio import workflow
 from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
-from tests._streams import provider, turn_events, workflow_environment
+from tests._streams import turn_events, workflow_environment
 
 from temporal_agent_harness.harness import AgentWorkflowRunner, agent
 from temporal_agent_harness.harness.agent_protocol import (
     SEND_AGENT_MESSAGE_UPDATE,
-    TURN_EVENTS_TOPIC,
     AgentConfig,
     AgentEvent,
     AgentEventType,
@@ -107,7 +104,6 @@ async def client_and_queue():
     task_queue = f"agent-tool-test-{uuid.uuid4()}"
     async with Worker(
         env.client,
-        plugins=[provider()],
         task_queue=task_queue,
         workflows=[ToolProbeAgent],
         activities=[agent.tool_activity(echo_activity_tool)],

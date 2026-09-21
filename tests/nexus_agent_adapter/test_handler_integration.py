@@ -19,7 +19,7 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from tests._streams import provider
+from tests._streams import streaming_client
 
 from temporal_agent_harness.harness import AgentWorkflowRunner, agent
 from temporal_agent_harness.harness.agent_protocol import AgentConfig, ToolApprovalPolicy
@@ -149,7 +149,7 @@ async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
 
 
 async def test_poll_messages_delivers_the_reply(env: WorkflowEnvironment) -> None:
-    client = env.client
+    client = streaming_client(env.client)
     endpoint_name = f"agent-endpoint-{uuid.uuid4()}"
     agent_task_queue = f"agent-{uuid.uuid4()}"
     nexus_task_queue = f"nexus-agent-{uuid.uuid4()}"
@@ -168,7 +168,6 @@ async def test_poll_messages_delivers_the_reply(env: WorkflowEnvironment) -> Non
         client,
         task_queue=agent_task_queue,
         workflows=[ProbeAgent],
-        plugins=[provider()],
     ), Worker(
         client,
         task_queue=nexus_task_queue,
@@ -231,7 +230,7 @@ async def test_send_agent_message_survives_handler_worker_restart(
 ) -> None:
     """Handler worker restarts between two sends on the same session; turn count still
     advances — state lives in the workflow, not the handler."""
-    client = env.client
+    client = streaming_client(env.client)
     endpoint_name = f"agent-endpoint-{uuid.uuid4()}"
     agent_task_queue = f"agent-{uuid.uuid4()}"
     nexus_task_queue = f"nexus-agent-{uuid.uuid4()}"
@@ -248,7 +247,7 @@ async def test_send_agent_message_survives_handler_worker_restart(
     session_id = str(uuid.uuid4())
 
     async with Worker(
-        client, task_queue=agent_task_queue, workflows=[ProbeAgent], plugins=[provider()]
+        client, task_queue=agent_task_queue, workflows=[ProbeAgent]
     ), Worker(
         client, task_queue=caller_task_queue, workflows=[SendOnlyCallerWorkflow]
     ):
@@ -319,7 +318,7 @@ async def test_poll_messages_closed_when_workflow_already_completed(
     env: WorkflowEnvironment,
 ) -> None:
     """A completed target workflow must produce closed=True synchronously, not an error."""
-    client = env.client
+    client = streaming_client(env.client)
     endpoint_name = f"agent-endpoint-{uuid.uuid4()}"
     nexus_task_queue = f"nexus-agent-{uuid.uuid4()}"
     completed_task_queue = f"completed-{uuid.uuid4()}"
@@ -486,7 +485,7 @@ class FullSurfaceCallerWorkflow:
 
 
 async def test_full_operation_surface(env: WorkflowEnvironment) -> None:
-    client = env.client
+    client = streaming_client(env.client)
     endpoint_name = f"agent-endpoint-{uuid.uuid4()}"
     agent_task_queue = f"agent-{uuid.uuid4()}"
     nexus_task_queue = f"nexus-agent-{uuid.uuid4()}"
@@ -505,7 +504,6 @@ async def test_full_operation_surface(env: WorkflowEnvironment) -> None:
         client,
         task_queue=agent_task_queue,
         workflows=[GatedProbeAgent],
-        plugins=[provider()],
     ), Worker(
         client,
         task_queue=nexus_task_queue,

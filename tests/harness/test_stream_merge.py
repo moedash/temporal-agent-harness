@@ -165,7 +165,7 @@ class _FakeStreams:
         self._drip_workflows = drip_workflows or {}
 
     def follow(
-        self, _provider: Any, _client: Any, workflow_id: str, *, after: str = ""
+        self, _client: Any, workflow_id: str, *, after: str = ""
     ) -> AsyncIterator[StreamRecord[AgentEvent]]:
         events = self._streams.get(workflow_id, [])
         fail_after = self._fail_workflows.get(workflow_id)
@@ -241,7 +241,6 @@ async def _run_merge(
     out: list[AgentEvent] = []
     with patch.object(cursor_mod, "follow_turn_events", fake.follow):
         async for ev, resume in merge_stream(
-            provider=None,
             client=None,
             root_workflow_id=root,
             root_resume=ResumePoint(cursor=root_after_cursor),
