@@ -19,7 +19,7 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from tests._streams import configure
+from tests._streams import provider
 
 from temporal_agent_harness.harness import AgentWorkflowRunner, agent
 from temporal_agent_harness.harness.agent_protocol import AgentConfig, ToolApprovalPolicy
@@ -139,7 +139,6 @@ class CallerWorkflow:
 
 @pytest_asyncio.fixture(scope="module")
 async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
-    configure()
     env = await WorkflowEnvironment.start_local(
         data_converter=pydantic_data_converter,
         dev_server_download_version=_DEV_SERVER_VERSION,
@@ -169,6 +168,7 @@ async def test_poll_messages_delivers_the_reply(env: WorkflowEnvironment) -> Non
         client,
         task_queue=agent_task_queue,
         workflows=[ProbeAgent],
+        plugins=[provider()],
     ), Worker(
         client,
         task_queue=nexus_task_queue,
@@ -248,7 +248,7 @@ async def test_send_agent_message_survives_handler_worker_restart(
     session_id = str(uuid.uuid4())
 
     async with Worker(
-        client, task_queue=agent_task_queue, workflows=[ProbeAgent]
+        client, task_queue=agent_task_queue, workflows=[ProbeAgent], plugins=[provider()]
     ), Worker(
         client, task_queue=caller_task_queue, workflows=[SendOnlyCallerWorkflow]
     ):
@@ -505,6 +505,7 @@ async def test_full_operation_surface(env: WorkflowEnvironment) -> None:
         client,
         task_queue=agent_task_queue,
         workflows=[GatedProbeAgent],
+        plugins=[provider()],
     ), Worker(
         client,
         task_queue=nexus_task_queue,

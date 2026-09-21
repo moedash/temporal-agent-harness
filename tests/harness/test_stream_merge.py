@@ -18,7 +18,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from temporalio.streams import Cursor, StreamRecord
+from temporalio.streams import Cursor, RecordKind, StreamRecord
 
 import temporal_agent_harness.harness.stream_merge.cursor as cursor_mod
 from temporal_agent_harness.harness.agent_protocol import (
@@ -165,7 +165,7 @@ class _FakeStreams:
         self._drip_workflows = drip_workflows or {}
 
     def follow(
-        self, _client: Any, workflow_id: str, *, after: str = ""
+        self, _provider: Any, _client: Any, workflow_id: str, *, after: str = ""
     ) -> AsyncIterator[StreamRecord[AgentEvent]]:
         events = self._streams.get(workflow_id, [])
         fail_after = self._fail_workflows.get(workflow_id)
@@ -186,7 +186,10 @@ class _FakeStreams:
                     if drip is not None:
                         await asyncio.sleep(drip)
                     yield StreamRecord(
-                        value=events[offset], cursor=Cursor(str(offset)), topic=TURN_EVENTS_TOPIC
+                        kind=RecordKind.DATA,
+                        cursor=Cursor(str(offset)),
+                        topic=TURN_EVENTS_TOPIC,
+                        value=events[offset],
                     )
                 if live_tail:
                     # Block forever (until cancelled by aclose) — a live, idle workflow's poll.
@@ -238,6 +241,7 @@ async def _run_merge(
     out: list[AgentEvent] = []
     with patch.object(cursor_mod, "follow_turn_events", fake.follow):
         async for ev, resume in merge_stream(
+            provider=None,
             client=None,
             root_workflow_id=root,
             root_resume=ResumePoint(cursor=root_after_cursor),
@@ -845,27 +849,21 @@ async def test_resume_point_advances_past_each_root_event():
     assert [p.cursor for p in points] == [str(i) for i in range(9)]
 
 
-def test_resume_point_round_trips_with_its_provider():
-    point = ResumePoint(cursor="7", seq=3)
-    text = point.encode(provider="redis")
-    assert text == "redis:3@7"
-    assert ResumePoint.decode(text, provider="redis") == point
-    # An unstamped point is still accepted, and the beginning encodes to nothing at all.
-    assert ResumePoint.decode("3@7", provider="redis") == point
-    assert ResumePoint().encode(provider="redis") == ""
-    assert ResumePoint.decode("", provider="redis") == ResumePoint()
+def test_resume_point_round_trips():
+    # The cursor token keeps its provider prefix and any separators of its own.
+    point = ResumePoint(cursor="native:run-1:7", seq=3)
+    text = point.encode()
+    assert text == "3@native:run-1:7"
+    assert ResumePoint.decode(text) == point
+    # The beginning encodes to nothing at all.
+    assert ResumePoint().encode() == ""
+    assert ResumePoint.decode("") == ResumePoint()
 
 
-def test_resume_point_from_another_provider_is_rejected():
-    text = ResumePoint(cursor="7", seq=3).encode(provider="native")
-    with pytest.raises(ValueError, match="native"):
-        ResumePoint.decode(text, provider="redis")
-
-
-@pytest.mark.parametrize("text", ["7", "x@7", "redis:x@7", "@"])
+@pytest.mark.parametrize("text", ["7", "x@7", "redis:3@7", "@"])
 def test_malformed_resume_point_is_rejected(text):
     with pytest.raises(ValueError):
-        ResumePoint.decode(text, provider="redis")
+        ResumePoint.decode(text)
 
 
 async def test_resume_from_offset_streams_only_events_after_it():

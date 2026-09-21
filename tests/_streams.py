@@ -15,21 +15,26 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from temporalio.client import Client
+from temporalio.streams import StreamProvider
 from temporalio.testing import WorkflowEnvironment
 
 from temporal_agent_harness.harness.agent_protocol import AgentEvent
 from temporal_agent_harness.harness.stream_transport import (
-    configure_from_env,
     follow_turn_events,
-    worker_options,
+    provider_from_env,
+    provider_name,
 )
 
-__all__ = ["configure", "turn_events", "worker_options", "workflow_environment"]
+__all__ = ["provider", "turn_events", "workflow_environment"]
 
 
-def configure() -> str:
-    """Name the provider for this test process. Safe to call more than once."""
-    return configure_from_env()
+def provider() -> StreamProvider:
+    """The provider this test process runs on.
+
+    One instance per process, so the worker's plugin, the activities and the readers share it;
+    the memory provider shares nothing between two instances.
+    """
+    return provider_from_env()
 
 
 async def workflow_environment(**kwargs: Any) -> WorkflowEnvironment:
@@ -39,7 +44,7 @@ async def workflow_environment(**kwargs: Any) -> WorkflowEnvironment:
     that provider connects to the one ``TEMPORAL_ADDRESS`` names rather than starting the
     time-skipping one.
     """
-    if configure() == "native":
+    if provider_name() == "native":
         address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
         return WorkflowEnvironment.from_client(await Client.connect(address, **kwargs))
     return await WorkflowEnvironment.start_time_skipping(**kwargs)
@@ -49,7 +54,7 @@ async def turn_events(
     client: Client, workflow_id: str, *, after: str = ""
 ) -> AsyncIterator[AgentEvent]:
     """Yield ``workflow_id``'s turn events from the beginning (or after a cursor), tailing live."""
-    records = follow_turn_events(client, workflow_id, after=after)
+    records = follow_turn_events(provider(), client, workflow_id, after=after)
     try:
         async for record in records:
             yield record.value
