@@ -3090,9 +3090,9 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pydantic-ai-slim", extras = ["temporal"], marker = "extra == 'pydantic-ai'", specifier = ">=2.13" },
     { name = "pydantic-monty", marker = "extra == 'code-mode'", specifier = ">=0.0.18" },
-    { name = "temporalio", git = "https://github.com/moedash/sdk-python?rev=435c583cedc8b33aff01b10581681c9bab068740" },
-    { name = "temporalio", extras = ["aioboto3"], marker = "extra == 's3'", git = "https://github.com/moedash/sdk-python?rev=435c583cedc8b33aff01b10581681c9bab068740" },
-    { name = "temporalio", extras = ["opentelemetry"], marker = "extra == 'openai-agents'", git = "https://github.com/moedash/sdk-python?rev=435c583cedc8b33aff01b10581681c9bab068740" },
+    { name = "temporalio", git = "https://github.com/moedash/sdk-python?rev=107d5d28bc3b33f258bdd1a8ec4b79334a21815b" },
+    { name = "temporalio", extras = ["aioboto3"], marker = "extra == 's3'", git = "https://github.com/moedash/sdk-python?rev=107d5d28bc3b33f258bdd1a8ec4b79334a21815b" },
+    { name = "temporalio", extras = ["opentelemetry"], marker = "extra == 'openai-agents'", git = "https://github.com/moedash/sdk-python?rev=107d5d28bc3b33f258bdd1a8ec4b79334a21815b" },
 ]
 provides-extras = ["genai", "s3", "openai-agents", "pydantic-ai", "ui", "code-mode"]
 
@@ -3111,9 +3111,9 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
     { name = "redis", specifier = ">=5,<9" },
     { name = "setuptools", specifier = ">=83.0.0" },
-    { name = "temporalio", extras = ["aioboto3"], git = "https://github.com/moedash/sdk-python?rev=435c583cedc8b33aff01b10581681c9bab068740" },
-    { name = "temporalio", extras = ["grpc"], git = "https://github.com/moedash/sdk-python?rev=435c583cedc8b33aff01b10581681c9bab068740" },
-    { name = "temporalio", extras = ["opentelemetry"], git = "https://github.com/moedash/sdk-python?rev=435c583cedc8b33aff01b10581681c9bab068740" },
+    { name = "temporalio", extras = ["aioboto3"], git = "https://github.com/moedash/sdk-python?rev=107d5d28bc3b33f258bdd1a8ec4b79334a21815b" },
+    { name = "temporalio", extras = ["grpc"], git = "https://github.com/moedash/sdk-python?rev=107d5d28bc3b33f258bdd1a8ec4b79334a21815b" },
+    { name = "temporalio", extras = ["opentelemetry"], git = "https://github.com/moedash/sdk-python?rev=107d5d28bc3b33f258bdd1a8ec4b79334a21815b" },
 ]
 examples = [
     { name = "fastapi", extras = ["standard"], specifier = ">=0.136.3" },
@@ -3128,7 +3128,7 @@ examples = [
 [[package]]
 name = "temporalio"
 version = "1.33.0"
-source = { git = "https://github.com/moedash/sdk-python?rev=435c583cedc8b33aff01b10581681c9bab068740#435c583cedc8b33aff01b10581681c9bab068740" }
+source = { git = "https://github.com/moedash/sdk-python?rev=107d5d28bc3b33f258bdd1a8ec4b79334a21815b#107d5d28bc3b33f258bdd1a8ec4b79334a21815b" }
 dependencies = [
     { name = "nexus-rpc" },
     { name = "protobuf" },
