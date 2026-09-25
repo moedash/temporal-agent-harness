@@ -15,6 +15,7 @@ from nexusrpc import HandlerError, HandlerErrorType
 from nexusrpc.handler import StartOperationContext, service_handler, sync_operation
 from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.service import RPCError
+from temporalio.streams import StreamCursorError
 
 from temporal_agent_harness.harness.agent_client import (
     AgentClient,
@@ -354,7 +355,12 @@ class AgentServiceHandler:
         cursor = input.cursor
         closed = False
         more_ready = False
-        events = follow_turn_events(self._client, workflow_id, after=cursor)
+        try:
+            # Opened inside the guard: the read parses the cursor at the call, so a token
+            # this provider did not mint is the caller's mistake and not a handler failure.
+            events = follow_turn_events(self._client, workflow_id, after=cursor)
+        except (ValueError, StreamCursorError) as e:
+            raise HandlerError(str(e), type=HandlerErrorType.BAD_REQUEST) from e
         try:
             async with asyncio.timeout(timeout) as window:
                 async for record in events:
