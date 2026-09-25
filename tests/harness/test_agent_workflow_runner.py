@@ -473,6 +473,50 @@ async def test_attach_replays_operator_only_history_and_stops(client_and_queue):
     ]
 
 
+async def test_attach_resuming_from_a_point_yields_exactly_what_follows_it(
+    client_and_queue,
+):
+    """Against the configured provider, not a scripted double.
+
+    Resume-after-a-cursor is the property every consumer of this stream depends on,
+    and proving it on a fake proves the fake. This drives a real provider: it reads
+    a session's events, takes the point handed back with the k-th one, and asserts
+    the resumed stream is exactly what came after it.
+    """
+    client, task_queue = client_and_queue
+    handle = await _start(client, task_queue, TypedProbeAgent)
+    # Several operator turns, so the stream holds enough events to resume inside.
+    for _ in range(3):
+        await _operator(handle, "status")
+    agent_client = AgentClient(client, handle.id)
+
+    seen: list[tuple[AgentEvent, str]] = []
+    stream = await agent_client.attach(
+        on_item=lambda item, resume: (item, resume.encode())
+    )
+    async with asyncio.timeout(20):
+        async for item in stream:
+            seen.append(item)
+
+    assert len(seen) >= 4, "the session needs enough events to resume inside"
+    k = len(seen) // 2
+    _, point = seen[k]
+
+    resumed: list[AgentEvent] = []
+    stream = await agent_client.attach(
+        on_item=lambda item, _resume: item, resume=point
+    )
+    async with asyncio.timeout(20):
+        async for item in stream:
+            resumed.append(item)
+
+    # Exactly what follows the point, in order, and nothing before it.
+    def identity(event: AgentEvent) -> tuple:
+        return (event.agent_id, event.turn_number, event.event.type, event.seq)
+
+    assert [identity(e) for e in resumed] == [identity(e) for e, _ in seen[k + 1 :]]
+
+
 async def test_attach_refuses_a_foreign_resume_point_before_streaming(client_and_queue):
     """A point minted by another stream provider fails the attach call itself, so a web layer
     can answer with a client error instead of failing after the response started."""
