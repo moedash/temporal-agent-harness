@@ -1,7 +1,7 @@
 """The tic-tac-toe board, as OBSERVABLE agent state, plus the one tool that moves on it.
 
 The board is a :class:`~temporal_agent_harness.harness.state.HarnessState` the workflow
-registers once with ``runner.state("board", Board())``; from then on every committed
+declares once, as the class attribute ``board = agent.state(Board)``; from then on every committed
 ``mutate()`` block publishes RFC 6902 patch ops on the agent's ``turn_events`` stream, which
 is what the console's AGENT STATE pane renders — so a move lands as ``replace /cells/4 "O"``
 right next to the ``tool_end`` that made it.
@@ -72,8 +72,7 @@ class Move(HarnessState):
     """One move that has been played, in order."""
 
     mark: Mark
-    cell: int
-    """1-9, left-to-right, top-to-bottom."""
+    cell: int = Field(description="1-9, left-to-right, top-to-bottom.")
 
 
 class Board(HarnessState):
@@ -165,8 +164,10 @@ class PlaceMarkResponse(BaseModel):
     mark: Mark
     cell: int
     status: Status
-    board: str
-    """The board after the move, rendered — so the tool_end shows the result of its own write."""
+    board: str = Field(
+        description="The board after the move, rendered — so the tool_end shows the result "
+        "of its own write."
+    )
 
 
 @agent.tool_defn(inherently_safe=True)

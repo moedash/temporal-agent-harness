@@ -28,8 +28,8 @@ chooses among cells the code offers, so an illegal move is impossible by constru
   per-cell probabilities, confidence, token usage) — expand the `typesafe_system_one` activity
   row to read both. (The harness's model-interaction events carry only a model id and usage,
   which is why the call is modeled as a tool rather than a model span for now.)
-- **The board as observable state.** `board.py` registers a `Board` `HarnessState` with
-  `runner.state("board", ...)`; open the **AGENT STATE** pane and each move lands as
+- **The board as observable state.** The workflow declares `board.py`'s `Board` `HarnessState`
+  as `board = agent.state(game.Board)`; open the **AGENT STATE** pane and each move lands as
   `replace /cells/4 "O"` + `add /moves/-` in one commit, ordered against the `tool_end` that
   made it. Your move is a patch too (applied in the handler); the agent's arrives via the tool.
 - **The reply.** Shows the pick with its confidence and the top of the distribution, the
@@ -45,7 +45,9 @@ chooses among cells the code offers, so an illegal move is impossible by constru
 - `workflow.py` — `TicTacToeAgent`: the `new_game` / `play` handlers, the question design, and
   the two `run_tool` dispatches (judge, then act).
 - `models.py` — the accepted messages and the activity's request/result shapes.
-- `play.html` — a single-file client you can double-click (see below).
+- `ui/` — a Svelte board for playing it, built on `@temporal-agent-harness/svelte` (see below).
+- `client_sdk/TicTacToeAgent.ts` — the agent's TypeScript types, generated from its Python
+  models by `just codegen-client-sdk`.
 
 ## Setup
 
@@ -81,20 +83,20 @@ Open <http://localhost:8000>, start a **Tic-Tac-Toe (TypeSafe)** session, send `
  7 | 8 | 9
 ```
 
-## `play.html` — a board drawn from JSON Patch
+## `ui/` — a board drawn from observable state
 
-With `just server` and `just worker` up, double-click `play.html`. It is one self-contained
-file, no build, no dependencies: it talks to the dev server's `/api` (default
-`http://localhost:8000`, editable in the page; the server allows any origin, including a page
-opened from disk), lists your open Tic-Tac-Toe sessions or creates one, and lets you play by
-clicking cells (or pressing 1–9).
+With `just server` and `just worker` up, `just play` serves the board on
+http://localhost:5173. It talks to the dev server's `/api` (default `http://localhost:8000`,
+editable in the page; the server allows any origin), lists your open Tic-Tac-Toe sessions or
+creates one, and lets you play by clicking cells (or pressing 1–9).
 
-The point of it: the board is rendered **only** from the agent's observable-state events. On
-attach it takes the `state_snapshot`, then folds every `state_patch` (RFC 6902 `add` /
-`replace` / `remove`) into a plain document and redraws — the page has no idea how a move is
-applied. The ledger on the right shows each patch's ops as they land (`replace /cells/4 "O"`),
-the TypeSafe tool's request and answer, and the agent's reply; the last judgment's per-cell
-probabilities are washed onto the empty cells so you can see what the model weighed.
+The board is rendered **only** from the agent's observable state: `agent.states.board`, typed as
+the generated `Board`, which `AgentSession` keeps current from the session's `state_snapshot`
+and `state_patch` events. The page has no idea how a move is applied. The ledger on the right
+reads the same session's raw frames — each patch's ops as they land (`replace /cells/4 "O"`),
+the TypeSafe tool's request and answer, and the agent's reply — and the last judgment's per-cell
+probabilities are washed onto the empty cells so you can see what the model weighed. A gated
+tool call shows approve / deny buttons.
 
-It uses two streams: `GET /api/attach` to replay history (it closes on its own once the agent is
-idle) and `POST /api/chat` to stream the one turn each move opens.
+The board and the ledger each construct their own `AgentSession` for the session; the
+`createHarnessContext()` above them makes the two share one connection.
