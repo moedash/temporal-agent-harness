@@ -225,6 +225,16 @@ class AgentEventType(StrEnum):
     UI). A drill-in UI keys off the carried ``subagent_id`` to mark that subagent's view degraded.
     See :class:`SubagentStreamUnavailable`."""
 
+    ATTEMPT_SUPERSEDED = "attempt_superseded"
+    """A streaming producer started a newer attempt, so everything the previous one wrote on
+    this turn is stale and a consumer that rendered it should drop it.
+
+    Like SUBAGENT_STREAM_UNAVAILABLE this is never published by a workflow: the stream reader
+    synthesizes it when a retried activity writes under a higher attempt, and the merge stamps
+    it with the agent and turn the superseded records belonged to. A consumer that keeps the
+    turn's deltas removes the ones it received before this marker; one that only renders the
+    final reply can ignore it. See :class:`AttemptSuperseded`."""
+
     REPLY_DELTA = "reply_delta"
     """An incremental text chunk (word/token) of the agent's reply. See
     :class:`ReplyDelta`."""
@@ -771,6 +781,31 @@ class SubagentStreamUnavailable(StreamEvent[Literal[AgentEventType.SUBAGENT_STRE
     )
 
 
+class AttemptSuperseded(StreamEvent[Literal[AgentEventType.ATTEMPT_SUPERSEDED]]):
+    """A newer attempt of one streaming producer supersedes everything the last one wrote.
+
+    SYNTHESIZED CLIENT-SIDE by the stream reader, never workflow-published. An activity that
+    streams half an answer and then fails leaves those records in the stream; its retry calls
+    the model again and writes different words. No provider can undo the first half, so the
+    reader says a new generation began and the consumer decides. The enclosing
+    :class:`AgentEvent` carries the ``agent_id`` and ``turn_id`` of the records being
+    superseded, so a consumer drops that turn's deltas received before this marker.
+    """
+
+    type: Literal[AgentEventType.ATTEMPT_SUPERSEDED] = AgentEventType.ATTEMPT_SUPERSEDED
+    producer_id: str = Field(
+        description="The producer whose attempt advanced, as the stream records carry it "
+        "(inside an activity, the activity id)."
+    )
+    superseded_attempt: int = Field(
+        description="The attempt whose records are stale. Everything this producer wrote under "
+        "it on this turn is replaced by what follows."
+    )
+    attempt: int = Field(
+        description="The attempt now writing. Records after this marker belong to it."
+    )
+
+
 class ReplyDelta(StreamEvent[Literal[AgentEventType.REPLY_DELTA]]):
     """An incremental text chunk of the agent's reply."""
 
@@ -849,6 +884,7 @@ AgentStreamItem = Annotated[
     | SubagentMessageSent
     | SubagentReplyReceived
     | SubagentStreamUnavailable
+    | AttemptSuperseded
     | ReplyDelta
     | ThoughtSummaryDelta
     | TextAnnotationDelta

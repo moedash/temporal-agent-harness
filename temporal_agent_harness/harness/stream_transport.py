@@ -10,6 +10,7 @@ import asyncio
 import os
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 
@@ -23,9 +24,14 @@ from temporalio.streams import (
     StreamProvider,
     StreamRecord,
     StreamTopic,
+    Supersession,
 )
 
-from temporal_agent_harness.harness.agent_protocol import TURN_EVENTS, AgentEvent
+from temporal_agent_harness.harness.agent_protocol import (
+    TURN_EVENTS,
+    AgentEvent,
+    AttemptSuperseded,
+)
 
 PROVIDER_ENV = "STREAMS_PROVIDER"
 DEFAULT_PROVIDER = "workflow_streams"
@@ -94,27 +100,59 @@ def follow_turn_events(
 ) -> AsyncGenerator[StreamRecord[AgentEvent], None]:
     """Yield ``workflow_id``'s turn events after the record ``after`` names, then tail live.
 
-    Only data records come out; a producer's finish marker and the supersession a reader
-    synthesizes when an activity is retried are not turn events. Each record carries the
-    cursor to store for a later ``after``. A token another provider minted is refused by this
-    call with ``StreamCursorError``, before anything is read. Closing the generator closes the
-    subscription, which matters on the transport that parks a long poll against the workflow.
-    ``client`` carries the stream provider as a plugin.
+    Data records come out, and so does the supersession a reader synthesizes when a streaming
+    activity is retried: an activity that streams half an answer and then fails leaves those
+    records in the stream, and its retry writes different words, so a consumer that rendered
+    the first half has to be told. A producer's finish marker does not come out. Each record
+    carries the cursor to store for a later ``after``. A token another provider minted is
+    refused by this call with ``StreamCursorError``, before anything is read. Closing the
+    generator closes the subscription, which matters on the transport that parks a long poll
+    against the workflow. ``client`` carries the stream provider as a plugin.
     """
     handle = client.get_stream_handle(workflow_id)
     records = handle.read(topic=TURN_EVENTS, after=cursor(after))
-    return _data_records(records)
+    return _turn_records(records)
 
 
-async def _data_records(
+async def _turn_records(
     records: AsyncGenerator[StreamRecord[AgentEvent], None],
 ) -> AsyncGenerator[StreamRecord[AgentEvent], None]:
+    """Data and supersession records, every one of them carrying an event.
+
+    A supersession is synthesized with no value of its own, and it names a producer and an
+    attempt rather than a turn. Stamping it here with the envelope of the last event this
+    stream produced is what makes it actionable: those are the records the retired attempt
+    wrote. Every consumer then reads ``record.value`` the same way, whatever the kind.
+    """
+    previous: AgentEvent | None = None
     try:
         async for record in records:
             if record.kind is RecordKind.DATA:
+                previous = record.value
                 yield record
+            elif record.kind is RecordKind.SUPERSEDED:
+                # Nothing was delivered on this stream yet, so the retired attempt's records
+                # are behind the caller's own start point and it holds none of them.
+                if previous is None or record.supersession is None:
+                    continue
+                yield replace(record, value=_superseded_event(previous, record.supersession))
     finally:
         await records.aclose()
+
+
+def _superseded_event(previous: AgentEvent, supersession: Supersession) -> AgentEvent:
+    """The marker for one supersession, in the turn whose records it retires."""
+    return AgentEvent(
+        agent_id=previous.agent_id,
+        turn_id=previous.turn_id,
+        turn_number=previous.turn_number,
+        timestamp=previous.timestamp,
+        event=AttemptSuperseded(
+            producer_id=supersession.producer_id,
+            superseded_attempt=supersession.previous_attempt,
+            attempt=supersession.attempt,
+        ),
+    )
 
 
 class ActivityPublisher:
