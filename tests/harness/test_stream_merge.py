@@ -18,7 +18,12 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from temporalio.streams import Cursor, RecordKind, StreamRecord
+from temporalio.streams import (
+    Cursor,
+    RecordKind,
+    StreamCursorError,
+    StreamRecord,
+)
 
 import temporal_agent_harness.harness.stream_merge.cursor as cursor_mod
 from temporal_agent_harness.harness.agent_protocol import (
@@ -149,6 +154,7 @@ class _FakeStreams:
         fail_workflows: dict[str, int] | None = None,
         live_tail_workflows: set[str] | None = None,
         drip_workflows: dict[str, float] | None = None,
+        refuse_workflows: set[str] | None = None,
     ) -> None:
         self._streams = streams
         # Collects the workflow_ids whose subscription the merge closed (unmount / teardown).
@@ -163,10 +169,15 @@ class _FakeStreams:
         # to prove the PER-CHILD stall deadline: a steadily-dripping sibling must NOT keep
         # resetting a dead child's clock.
         self._drip_workflows = drip_workflows or {}
+        # Streams whose read is refused AT THE CALL, the way a provider refuses a
+        # cursor it did not mint: the parse is eager, so it never reaches a pull.
+        self._refuse_workflows = refuse_workflows or set()
 
     def follow(
         self, _client: Any, workflow_id: str, *, after: str = ""
     ) -> AsyncIterator[StreamRecord[AgentEvent]]:
+        if workflow_id in self._refuse_workflows:
+            raise StreamCursorError(f"cursor {after!r} was not minted by this provider")
         events = self._streams.get(workflow_id, [])
         fail_after = self._fail_workflows.get(workflow_id)
         live_tail = workflow_id in self._live_tail_workflows
@@ -218,6 +229,7 @@ async def _run_merge(
     fail_workflows: dict[str, int] | None = None,
     live_tail_workflows: set[str] | None = None,
     drip_workflows: dict[str, float] | None = None,
+    refuse_workflows: set[str] | None = None,
     stall_grace_seconds: float = 5.0,
     resume_points: list[ResumePoint] | None = None,
 ) -> list[AgentEvent]:
@@ -237,6 +249,7 @@ async def _run_merge(
         fail_workflows=fail_workflows,
         live_tail_workflows=live_tail_workflows,
         drip_workflows=drip_workflows,
+        refuse_workflows=refuse_workflows,
     )
     out: list[AgentEvent] = []
     with patch.object(cursor_mod, "follow_turn_events", fake.follow):
@@ -977,3 +990,45 @@ async def test_redispatched_given_up_child_reenables_its_close_gate():
     open_i, close_i = ms_positions[-1], rr_positions[-1]
     child_pos = [i for i, m in enumerate(merged) if m.agent_id == "C"]
     assert child_pos and all(open_i < i < close_i for i in child_pos)
+
+
+async def test_a_child_whose_cursor_the_provider_refuses_drops_only_that_child():
+    # The read parses the cursor at the call, so a provider that refuses a child's
+    # after_cursor raises while the child is being mounted, not on its first pull.
+    # Unguarded there, one refused child ends the whole merged stream.
+    streams = {
+        "P": [
+            _ts("P", 1),
+            _ms("P", 1, child="C", child_turn=1),
+            _rr("P", 1, child="C", child_turn=1),
+            _reply("P", 1),
+            _te("P", 1),
+        ],
+        "C": [_ts("C", 1), _reply("C", 1), _te("C", 1)],
+    }
+    merged = await _run_merge(
+        streams,
+        root="P",
+        select=select_replay,
+        refuse_workflows={"C"},
+    )
+    # The parent's whole stream flows, close gate and all.
+    assert [m.event.type for m in merged if m.agent_id == "P"] == [
+        AgentEventType.TURN_STARTED,
+        AgentEventType.SUBAGENT_MESSAGE_SENT,
+        AgentEventType.SUBAGENT_REPLY_RECEIVED,
+        AgentEventType.REPLY,
+        AgentEventType.TURN_END,
+    ]
+    # The refused child lands on the same marker an unreadable one does.
+    markers = [
+        m for m in merged if m.event.type == AgentEventType.SUBAGENT_STREAM_UNAVAILABLE
+    ]
+    assert len(markers) == 1
+    assert markers[0].event.workflow_id == "C"
+    assert not [
+        m
+        for m in merged
+        if m.agent_id == "C"
+        and m.event.type != AgentEventType.SUBAGENT_STREAM_UNAVAILABLE
+    ]

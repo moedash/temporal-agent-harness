@@ -270,9 +270,21 @@ class _Merge:
                 )
                 if isinstance(action, MountChild):
                     self._subagent_ids[action.workflow_id] = action.subagent_id
-                    self._mount(
-                        action.workflow_id, after=action.after_cursor, is_child=True
-                    )
+                    try:
+                        self._mount(
+                            action.workflow_id, after=action.after_cursor, is_child=True
+                        )
+                    except Exception as exc:  # noqa: BLE001 -- one child, not the merge
+                        # The read parses the child's cursor at the call, so a provider that
+                        # refuses it raises here rather than on the first pull. That is one
+                        # subagent's detail lost, which is what the give-up path is for.
+                        _log.warning(
+                            "stream_merge: giving up on subagent %s, its stream could not be "
+                            "mounted: %r",
+                            action.workflow_id,
+                            exc,
+                        )
+                        await self._give_up(action.workflow_id)
                 elif isinstance(action, UnmountChild):
                     # The child is drained + idle by the time its subagent_stopped surfaces, so
                     # closing its cursor strands no gated event and frees its in-flight poll update.

@@ -52,7 +52,7 @@ without revisiting this.
 ## Mounting / unmounting + graceful degradation
 
 - **Mount** on `subagent_message_sent` (idempotent — a re-used child mounts once; it carries both
-  the child `workflow_id` and the `from_offset` to position the cursor).
+  the child `workflow_id` and the `after_cursor` to position the cursor).
 - **Unmount** on `subagent_stopped` (and when a child cursor turns out unreadable/exhausted): the
   engine closes that child's cursor and drops it. This is safe because `subagent_stopped` is emitted
   at a quiescent point — by then every one of that child's turns is drained, and a stopped
@@ -103,19 +103,21 @@ recursively), so that's a clean, empty-bracket start.
 
 `attach` resumes from an **arbitrary** offset with **no skip** — and that's still safe without
 bracket reconstruction, because the merge only ever *mounts* a child when it *emits* that child's
-`subagent_message_sent`. A subagent whose turn began before the resume offset is therefore never
+`subagent_message_sent`. A subagent whose turn began before the resume point is therefore never
 mounted: its events are simply absent, and its later `subagent_reply_received` (which would otherwise
 close-gate forever) is released by the **unmounted-stuck give-up** — the engine sees a buffered
 `reply_received` for a child that isn't mounted, knows its `turn_end` can never come, and gives up at
-once. Subagents dispatched at/after the offset mount and bracket-merge normally. So no per-stream
-offset vector is ever needed — just the scalar root offset plus `subagent_message_sent.from_offset`.
+once. Subagents dispatched at/after the point mount and bracket-merge normally. So no per-stream
+position vector is ever needed — just the root point plus `subagent_message_sent.after_cursor`.
 
-The merge yields a `(event, resume_offset)` pair per step; `resume_offset` is a **root-stream**
-offset that advances **only on root events** — every subagent event between two root events carries
-the same value (the position just past the preceding root event). A consumer records the latest and
-hands it back to `attach(from_offset=...)`. Two consequences a consumer must understand:
+The merge yields a `(event, ResumePoint)` pair per step; the point is a **root-stream** position
+that advances **only on root events** — every subagent event between two root events carries
+the same value (the position just past the preceding root event). It pairs the provider's opaque
+cursor for that root record with the root agent's `seq`, encodes to one string, and a consumer
+records the latest and hands it back to `attach(resume=...)`. Two consequences a consumer must
+understand:
 
-- **Any root offset is a *valid* resume point** — the merge never produces a broken ordering or
+- **Any root position is a *valid* resume point** — the merge never produces a broken ordering or
   wedges from one. It is *not* the merged display ordinal (the cross-stream interleaving itself isn't
   a resumable position).
 - **Resume is lossless only at root-event granularity.** A consumer that disconnects *mid a
@@ -123,16 +125,17 @@ hands it back to `attach(from_offset=...)`. Two consequences a consumer must und
   resume the root starts past that subagent's `subagent_message_sent`, so the merge never re-mounts
   it (and emits **no** `subagent_stream_unavailable` marker — it treats the detail as already
   delivered). The parent's reply and everything after it still flow. A consumer that needs every
-  subagent event across a mid-turn reconnect must re-attach from `0`.
+  subagent event across a mid-turn reconnect must re-attach with an empty `resume`.
 
 ## Entry points
 
-`merge_stream(client, root_workflow_id, root_from_offset, skip_until_turn_id, select, should_stop,
-stall_grace_seconds)` yields `(AgentEvent, resume_offset)` pairs. `AgentClient` wraps it:
-- **send_message** → `root_from_offset = reply.accepted_offset`, `skip_until_turn_id = reply.turn_id`,
-  `select_live`, stop at the root's `turn_end` for that turn.
-- **attach (full replay)** → `from_offset = 0`, no skip, `select_replay`, stop via status re-query
+`merge_stream(client, root_workflow_id, root_resume, skip_until_turn_id, select, should_stop,
+stall_grace_seconds)` yields `(AgentEvent, ResumePoint)` pairs. `AgentClient` wraps it:
+- **send_message** → `root_resume` is the stream's latest position read before the send (the reply
+  carries none: a workflow does not see where its own records land), `skip_until_turn_id =
+  reply.turn_id`, `select_live`, stop at the root's `turn_end` for that turn.
+- **attach (full replay)** → empty `resume`, no skip, `select_replay`, stop via status re-query
   (root idle and all turns through `current_turn` ended).
-- **attach (resume)** → `from_offset = <any resume offset the previous stream handed back>`, no skip,
+- **attach (resume)** → `resume = <any point the previous stream handed back>`, no skip,
   `select_replay`; streams only events after it (a subagent whose turn began earlier is omitted; its
   `reply_received` released by the unmounted-stuck give-up).
