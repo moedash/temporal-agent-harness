@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -58,6 +59,9 @@ from temporal_agent_harness.web.session_manager import (
     Session,
     SessionManagerWorkflow,
 )
+
+logger = logging.getLogger(__name__)
+
 
 RegistrySource = AgentRegistry | Callable[[], AgentRegistry]
 _SESSION_PREVIEW_HISTORY_PAGE_SIZE = 16
@@ -245,11 +249,21 @@ def create_agent_harness_app(
     async def attach(session_id: str, resume: str = "") -> StreamingResponse:
         client = AgentClient(temporal=app.state.temporal, workflow_id=session_id)
         try:
+            # Decoded here rather than inside the call, so the 400 covers the resume point
+            # and nothing else. `pydantic_core.ValidationError` is a `ValueError`, and a
+            # model skew between this process and the workflow is not the caller's fault.
+            ResumePoint.decode(resume)
+        except ValueError as e:
+            logger.info("attach refused a resume point for %s: %r", session_id, e)
+            raise HTTPException(status_code=400, detail="invalid resume point") from e
+        try:
             items = await client.attach(on_item=_yield_item, resume=resume)
-        except (ValueError, StreamCursorError) as e:
-            # A stale tab after a provider switch, or a client bug. A 400 tells the UI to
-            # re-attach from the beginning; a 500 would tell it nothing.
-            raise HTTPException(status_code=400, detail=f"invalid resume point: {e}") from e
+        except StreamCursorError as e:
+            # A stale tab after a provider switch. A 400 tells the UI to re-attach from the
+            # beginning; a 500 would tell it nothing. The token itself is the caller's and is
+            # not echoed back to it.
+            logger.info("attach refused a resume point for %s: %r", session_id, e)
+            raise HTTPException(status_code=400, detail="invalid resume point") from e
         return StreamingResponse(items, media_type="text/event-stream", headers=_sse_headers())
 
     @app.post("/api/approve")

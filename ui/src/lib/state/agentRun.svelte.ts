@@ -3,8 +3,10 @@ import type {
   AgentInterfaceFunction,
   AgentMessageObject,
   AgentSseFrame,
+  AttemptSupersededEvent,
   OperatorCommand,
   OperatorCommandResponse,
+  ResumePoint,
   WorkflowExecutionState
 } from "$lib/api/types";
 import type { AgentApi } from "$lib/api/client";
@@ -182,7 +184,7 @@ function displayTextForMessage(message: AgentInboundMessage): string {
 }
 
 function frameKey(frame: AgentSseFrame): string {
-  const { resume_offset: _resumeOffset, ...identityData } = frame.data;
+  const { resume: _resume, ...identityData } = frame.data;
   return `${frame.event}|${JSON.stringify(identityData)}`;
 }
 
@@ -229,14 +231,14 @@ export class AgentRunController {
   sessions = $state<Session[]>([]);
   session = $state<Session | null>(null);
   expectedTurn = $state(1);
-  lastResumeOffset = $state(0);
+  lastResume = $state("");
   #streamVersion = 0;
   #connectionVersion = 0;
   #sendVersion = 0;
   #streamAbort: AbortController | null = null;
   #interfaceRequests = new Set<string>();
   #operatorInterfaceRequests = new Set<string>();
-  #workflowResumeOffsets = new Map<string, number>();
+  #workflowResume = new Map<string, ResumePoint>();
   #workflowAttachAbort = new Map<string, AbortController>();
   #frameKeys = new Set<string>();
   #frameCacheTimer: number | null = null;
@@ -550,9 +552,9 @@ export class AgentRunController {
     this.#applyWorkflowExecutionState(state);
   }
 
-  #resumeOffsetForWorkflow(workflowId: string): number {
-    if (workflowId === this.session?.workflow_id) return this.lastResumeOffset;
-    return this.#workflowResumeOffsets.get(workflowId) ?? 0;
+  #resumeForWorkflow(workflowId: string): ResumePoint {
+    if (workflowId === this.session?.workflow_id) return this.lastResume;
+    return this.#workflowResume.get(workflowId) ?? "";
   }
 
   #operatorTargets(): OperatorTarget[] {
@@ -749,7 +751,7 @@ export class AgentRunController {
 
       if (!this.#isCurrentConnection(connectionVersion)) return;
       if (this.#isWorkflowClosed(this.session.workflow_id)) return;
-      await this.attach(this.lastResumeOffset);
+      await this.attach(this.lastResume);
     } catch (error) {
       if (this.#isCurrentConnection(connectionVersion) && !isAbortError(error)) {
         this.connectionError =
@@ -812,7 +814,7 @@ export class AgentRunController {
       await this.#refreshWorkflowExecutionState(session.workflow_id);
       if (!this.#isCurrentConnection(connectionVersion)) return;
       if (this.#isWorkflowClosed(session.workflow_id)) return;
-      await this.attach(0);
+      await this.attach("");
     } catch (error) {
       if (this.#isCurrentConnection(connectionVersion) && !isAbortError(error)) {
         this.connectionError =
@@ -851,7 +853,7 @@ export class AgentRunController {
       await this.#refreshWorkflowExecutionState(session.workflow_id);
       if (!this.#isCurrentConnection(connectionVersion)) return;
       if (this.#isWorkflowClosed(session.workflow_id)) return;
-      await this.attach(this.lastResumeOffset);
+      await this.attach(this.lastResume);
     } catch (error) {
       if (this.#isCurrentConnection(connectionVersion) && !isAbortError(error)) {
         this.connectionError =
@@ -863,7 +865,7 @@ export class AgentRunController {
   }
 
   async attach(
-    fromOffset = this.lastResumeOffset,
+    resume = this.lastResume,
     options: { clearSendingOnIdle?: boolean } = {}
   ): Promise<void> {
     const session = this.session;
@@ -871,7 +873,7 @@ export class AgentRunController {
 
     const { controller, signal, streamVersion } = this.#beginStream();
     try {
-      for await (const frame of this.#api.attach(session.workflow_id, fromOffset, signal)) {
+      for await (const frame of this.#api.attach(session.workflow_id, resume, signal)) {
         if (streamVersion !== this.#streamVersion || this.session?.workflow_id !== session.workflow_id) {
           break;
         }
@@ -893,7 +895,7 @@ export class AgentRunController {
 
   async #attachWorkflow(
     workflowId: string,
-    fromOffset = this.#resumeOffsetForWorkflow(workflowId)
+    resume = this.#resumeForWorkflow(workflowId)
   ): Promise<void> {
     const session = this.session;
     if (!session || !this.#isKnownWorkflowId(workflowId)) return;
@@ -904,7 +906,7 @@ export class AgentRunController {
     try {
       for await (const frame of this.#api.attach(
         workflowId,
-        fromOffset,
+        resume,
         controller.signal
       )) {
         if (
@@ -967,7 +969,7 @@ export class AgentRunController {
     try {
       await submitted;
       if (this.session?.workflow_id !== session.workflow_id) return;
-      void this.attach(this.lastResumeOffset, { clearSendingOnIdle: true }).catch(
+      void this.attach(this.lastResume, { clearSendingOnIdle: true }).catch(
         (error: unknown) => {
           if (!isAbortError(error) && this.session?.workflow_id === session.workflow_id) {
             this.connectionError =
@@ -984,7 +986,7 @@ export class AgentRunController {
       this.connectionError =
         error instanceof Error ? error.message : "Failed to send message.";
       this.sending = false;
-      await this.attach(this.lastResumeOffset);
+      await this.attach(this.lastResume);
     }
   }
 
@@ -1025,7 +1027,7 @@ export class AgentRunController {
       }
       if (targetWorkflowId === session.workflow_id) {
         const shouldClearSendingOnIdle = this.sending;
-        void this.attach(this.lastResumeOffset, {
+        void this.attach(this.lastResume, {
           clearSendingOnIdle: shouldClearSendingOnIdle
         }).catch((error: unknown) => {
           if (!isAbortError(error) && this.session?.workflow_id === session.workflow_id) {
@@ -1037,7 +1039,7 @@ export class AgentRunController {
       } else {
         void this.#attachWorkflow(
           targetWorkflowId,
-          this.#resumeOffsetForWorkflow(targetWorkflowId)
+          this.#resumeForWorkflow(targetWorkflowId)
         ).catch((error: unknown) => {
           if (!isAbortError(error) && this.session?.workflow_id === session.workflow_id) {
             this.connectionError =
@@ -1137,11 +1139,11 @@ export class AgentRunController {
     this.frames = [];
     this.observedSubagents = [];
     this.#frameKeys = new Set<string>();
-    this.#workflowResumeOffsets = new Map<string, number>();
+    this.#workflowResume = new Map<string, ResumePoint>();
     this.viewIndex = 0;
     this.following = false;
     this.expectedTurn = 1;
-    this.lastResumeOffset = 0;
+    this.lastResume = "";
   }
 
   #appendFrame(
@@ -1159,30 +1161,24 @@ export class AgentRunController {
       this.#publisherWorkflowId(frame) ?? options.sourceWorkflowId;
     const isRootFrame = publisherWorkflowId === this.session?.workflow_id;
 
+    if (frame.event === "attempt_superseded") {
+      this.#dropSupersededFrames(frame.data);
+    }
+
     this.frames = [...this.frames, frame];
     this.following = true;
     this.viewIndex = this.total;
 
-    if (
-      "resume_offset" in frame.data &&
-      typeof frame.data.resume_offset === "number"
-    ) {
-      const resumeOffsetOwner =
+    if ("resume" in frame.data && typeof frame.data.resume === "string") {
+      // The point is opaque, so the newest one on a stream wins. It is already
+      // monotonic along that stream, and nothing here may compare two of them.
+      const resumeOwner =
         options.sourceWorkflowId ?? (isRootFrame ? publisherWorkflowId : undefined);
-      if (resumeOffsetOwner) {
-        this.#workflowResumeOffsets.set(
-          resumeOffsetOwner,
-          Math.max(
-            this.#workflowResumeOffsets.get(resumeOffsetOwner) ?? 0,
-            frame.data.resume_offset
-          )
-        );
+      if (resumeOwner) {
+        this.#workflowResume.set(resumeOwner, frame.data.resume);
       }
       if (isRootFrame) {
-        this.lastResumeOffset = Math.max(
-          this.lastResumeOffset,
-          frame.data.resume_offset
-        );
+        this.lastResume = frame.data.resume;
       }
     }
     if (
@@ -1207,6 +1203,23 @@ export class AgentRunController {
     }
     this.#handleSubagentEvent(frame, publisherWorkflowId);
     if (options.persist !== false) this.#scheduleFrameCacheWrite();
+  }
+
+  #dropSupersededFrames(marker: AttemptSupersededEvent): void {
+    // A retried streaming activity writes different words for the same turn, and the
+    // half-answer the first attempt already rendered is what the marker retires. The
+    // marker carries the turn it applies to, so only that turn's own events go.
+    const retired = new Set<string>();
+    this.frames = this.frames.filter((frame) => {
+      if (!("type" in frame.data)) return true;
+      if (frame.data.agent_id !== marker.agent_id) return true;
+      if (frame.data.turn_id !== marker.turn_id) return true;
+      if (frame.data.type === "attempt_superseded") return true;
+      retired.add(frameKey(frame));
+      return false;
+    });
+    for (const key of retired) this.#frameKeys.delete(key);
+    this.viewIndex = Math.min(this.viewIndex, this.frames.length);
   }
 
   #publisherWorkflowId(frame: AgentSseFrame): string | undefined {

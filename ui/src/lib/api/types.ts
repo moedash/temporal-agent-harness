@@ -1,6 +1,7 @@
 export type UnixEpochSeconds = number;
-export type ResumeOffset = number;
-export type StreamOffset = ResumeOffset;
+// The encoded point the merged stream hands back on every frame, opaque to the
+// browser: the provider that minted the cursor inside it is the only reader.
+export type ResumePoint = string;
 export type WorkflowId = string;
 export type TurnId = string;
 export type ToolId = string;
@@ -152,7 +153,6 @@ export interface ChatRequest {
 export interface SubmitMessageResponse {
   turn_number: number;
   turn_id: TurnId;
-  accepted_offset: StreamOffset;
   pending: boolean;
 }
 
@@ -240,6 +240,7 @@ export type AgentEventType =
   | "subagent_message_sent"
   | "subagent_reply_received"
   | "subagent_stream_unavailable"
+  | "attempt_superseded"
   | "reply_delta"
   | "thought_summary"
   | "text_annotation"
@@ -251,7 +252,7 @@ export interface AgentEventMetadata {
   turn_id: TurnId;
   turn_number: number;
   timestamp: UnixEpochSeconds;
-  resume_offset: ResumeOffset;
+  resume?: ResumePoint;
 }
 
 export interface AgentEventDataBase<TType extends AgentEventType>
@@ -371,7 +372,7 @@ export interface SubagentMessageSentEvent
   workflow_id: string;
   function: string;
   subagent_turn: number;
-  from_offset: number;
+  after_cursor: string;
 }
 
 export interface SubagentReplyReceivedEvent
@@ -389,6 +390,15 @@ export interface SubagentStreamUnavailableEvent
   subagent_id: string;
   workflow_id: string;
   reason: string;
+}
+
+// Synthesized by the stream reader when a retried streaming activity writes under a
+// higher attempt. The envelope names the turn whose deltas the retired attempt wrote.
+export interface AttemptSupersededEvent
+  extends AgentEventDataBase<"attempt_superseded"> {
+  producer_id: string;
+  superseded_attempt: number;
+  attempt: number;
 }
 
 export interface ReplyDeltaEvent extends AgentEventDataBase<"reply_delta"> {
@@ -450,7 +460,7 @@ export interface AgentErrorEvent extends AgentEventDataBase<"error"> {
 export interface ClientSideStreamErrorEvent {
   kind: "timeout" | "agent";
   message: string;
-  resume_offset: ResumeOffset;
+  resume?: ResumePoint;
 }
 
 export interface AgentSseEventMap {
@@ -474,6 +484,7 @@ export interface AgentSseEventMap {
   subagent_message_sent: SubagentMessageSentEvent;
   subagent_reply_received: SubagentReplyReceivedEvent;
   subagent_stream_unavailable: SubagentStreamUnavailableEvent;
+  attempt_superseded: AttemptSupersededEvent;
   reply_delta: ReplyDeltaEvent;
   thought_summary: ThoughtSummaryEvent;
   text_annotation: TextAnnotationEvent;
