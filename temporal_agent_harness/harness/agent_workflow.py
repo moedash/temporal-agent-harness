@@ -2354,8 +2354,8 @@ class AgentWorkflowRunner:
             timestamp=workflow.time(),
             seq=self._status.next_event_seq(),
         )
-        # The record commits with this Workflow Task. A record the provider cannot stage
-        # raises StreamError here and fails the task, which is the loud outcome we want.
+        # The record commits with this Workflow Task. An unconvertible value raises here; a
+        # record the provider cannot stage fails the task at commit. Either way it is loud.
         self._events.publish(envelope)
 
 
