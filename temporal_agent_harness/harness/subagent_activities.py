@@ -41,6 +41,7 @@ from pydantic import BaseModel
 from temporalio import activity
 from temporalio.client import Client, WorkflowUpdateFailedError
 from temporalio.exceptions import ApplicationError
+from temporalio.streams import StreamCursorError
 
 from temporal_agent_harness.harness.agent_client import (
     AgentBusyError,
@@ -177,9 +178,16 @@ class SubagentActivities:
         """
         output: dict[str, Any] = {}
         got_reply = False
-        events = follow_turn_events(
-            self._client, req.child_workflow_id, after=progress.consumed_cursor
-        )
+        try:
+            events = follow_turn_events(
+                self._client, req.child_workflow_id, after=progress.consumed_cursor
+            )
+        except StreamCursorError:
+            # The cursor is a hint, so a provider that will not take it costs a replay and
+            # nothing else: the loop filters to this turn's turn_id either way. A switched
+            # provider must not fail every in-flight session's next subagent turn.
+            progress.consumed_cursor = ""
+            events = follow_turn_events(self._client, req.child_workflow_id, after="")
         try:
             async for record in events:
                 # Advance the resume cursor for EVERY record seen (mutated in place so the

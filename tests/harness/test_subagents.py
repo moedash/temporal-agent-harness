@@ -6,22 +6,32 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import BaseModel, Field
 from temporalio.exceptions import ApplicationError
+from temporalio.streams import Cursor, RecordKind, StreamCursorError, StreamRecord
 
-from temporal_agent_harness.harness import agent
+from temporal_agent_harness.harness import agent, subagent_activities
 from temporal_agent_harness.harness.agent_protocol import (
+    TURN_EVENTS_TOPIC,
     AgentEvent,
+    AgentReply,
     SlashCommand,
     SubagentMessageSent,
     SubagentStarted,
     SubagentStopped,
     TextReply,
     ToolApprovalPolicy,
+    TurnEnded,
 )
 from temporal_agent_harness.harness.agent_workflow import _SubagentInstance, _WorkflowStatus
+from temporal_agent_harness.harness.subagent_activities import (
+    _TurnProgress,
+    SubagentActivities,
+)
 
 
 # A minimal child agent for exercising the toolset generator. No @workflow.defn is needed —
@@ -286,3 +296,56 @@ def test_distinct_subagents_have_independent_gates_and_counters():
     a.take_ticket()
     assert a._next_ticket == 1
     assert b._next_ticket == 0
+
+
+async def test_a_child_cursor_the_provider_refuses_replays_instead_of_failing_the_turn():
+    # `after_cursor` is documented as a hint that can never break correctness, but a
+    # provider mints it and refuses another's synchronously. Left to raise, switching
+    # providers fails every in-flight session's next subagent turn.
+    events = [
+        AgentEvent(
+            agent_id="C",
+            turn_id="turn-1",
+            turn_number=1,
+            timestamp=0.0,
+            event=AgentReply(output={"answer": 42}),
+        ),
+        AgentEvent(
+            agent_id="C",
+            turn_id="turn-1",
+            turn_number=1,
+            timestamp=0.0,
+            event=TurnEnded(turn_number=1),
+        ),
+    ]
+    asked: list[str] = []
+
+    def follow(_client, _workflow_id, *, after=""):
+        asked.append(after)
+        if after:
+            raise StreamCursorError(f"cursor {after!r} was not minted by this provider")
+
+        async def gen():
+            for index, event in enumerate(events):
+                yield StreamRecord(
+                    kind=RecordKind.DATA,
+                    cursor=Cursor(str(index)),
+                    topic=TURN_EVENTS_TOPIC,
+                    value=event,
+                )
+
+        return gen()
+
+    activities = SubagentActivities(client=MagicMock())
+    progress = _TurnProgress(
+        sent=True, turn_id="turn-1", turn_number=1, consumed_cursor="memory:7"
+    )
+    req = SimpleNamespace(child_workflow_id="C")
+
+    with patch.object(subagent_activities, "follow_turn_events", follow):
+        output, got_reply = await activities._consume_child_turn(req, progress)
+
+    assert got_reply and output == {"answer": 42}
+    # Asked once with the stale hint, then from the beginning.
+    assert asked == ["memory:7", ""]
+    assert progress.consumed_cursor == "1"
