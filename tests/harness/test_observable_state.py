@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import gc
 import uuid
-from datetime import timedelta
 from typing import Any
 
 from temporalio import workflow
@@ -33,9 +32,9 @@ with workflow.unsafe.imports_passed_through():
     import pytest_asyncio
     from temporalio.client import Client, WorkflowHandle
     from temporalio.contrib.pydantic import pydantic_data_converter
-    from temporalio.contrib.workflow_streams import WorkflowStream, WorkflowStreamClient
-    from temporalio.testing import WorkflowEnvironment
     from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+
+    from tests._streams import turn_events, workflow_environment
 
     from temporal_agent_harness.harness import agent
     from temporal_agent_harness.harness.agent_protocol import (
@@ -80,7 +79,6 @@ class StateProbeAgent:
     def __init__(self, config: AgentConfig) -> None:
         self._runner = AgentWorkflowRunner(
             config,
-            stream=WorkflowStream(),
             approval_policy_default=ToolApprovalPolicy.dangerously_skip_all(),
         )
 
@@ -121,7 +119,6 @@ class EarlyStateProbeAgent:
             d.goal = "set before the runner existed"
         self._runner = AgentWorkflowRunner(
             config,
-            stream=WorkflowStream(),
             approval_policy_default=ToolApprovalPolicy.dangerously_skip_all(),
         )
 
@@ -144,7 +141,7 @@ class EarlyStateProbeAgent:
 
 @pytest_asyncio.fixture
 async def client_and_queue():
-    env = await WorkflowEnvironment.start_time_skipping(
+    env = await workflow_environment(
         data_converter=pydantic_data_converter
     )
     task_queue = f"observable-state-test-{uuid.uuid4()}"
@@ -182,17 +179,11 @@ async def _run_turn(
 
 
 async def _collect(client: Client, workflow_id: str) -> list[AgentEvent]:
-    stream = WorkflowStreamClient.create(client, workflow_id)
     events: list[AgentEvent] = []
     async with asyncio.timeout(60):
-        async for item in stream.subscribe(
-            topics=["turn_events"],
-            from_offset=0,
-            result_type=AgentEvent,
-            poll_cooldown=timedelta(milliseconds=10),
-        ):
-            events.append(item.data)
-            if item.data.event.type == AgentEventType.TURN_END:
+        async for item in turn_events(client, workflow_id):
+            events.append(item)
+            if item.event.type == AgentEventType.TURN_END:
                 break
     return events
 
@@ -364,10 +355,7 @@ async def test_attach_to_a_brand_new_session_delivers_the_snapshot_and_stops(
     )
     agent_client = AgentClient(client, handle.id)
 
-    stream = await agent_client.attach(
-        from_offset=0,
-        on_item=lambda item, _resume_offset: item,
-    )
+    stream = await agent_client.attach(on_item=lambda item, _resume: item)
     items: list[AgentEvent] = []
     async with asyncio.timeout(10):
         async for item in stream:
@@ -438,7 +426,7 @@ class SandboxStateProbe:
 @pytest_asyncio.fixture
 async def sandboxed_queue():
     """A worker on the DEFAULT workflow runner — i.e. the real sandbox."""
-    env = await WorkflowEnvironment.start_time_skipping(
+    env = await workflow_environment(
         data_converter=pydantic_data_converter
     )
     task_queue = f"sandboxed-state-test-{uuid.uuid4()}"
