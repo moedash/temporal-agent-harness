@@ -130,21 +130,30 @@ class TemporalOpenAIRunner(AgentRunner):
                 )
 
         if starting_agent.mcp_servers:
-            from temporal_agent_harness.ai_sdks.openai_agents._mcp import (
-                _StatefulMCPServerReference,
-                _StatelessMCPServerReference,
-            )
+            with workflow.unsafe.imports_passed_through():
+                from temporal_agent_harness.ai_sdks.openai_agents_harness import (
+                    is_durable_mcp_server,
+                    is_harness_mcp_server,
+                )
 
             for s in starting_agent.mcp_servers:
-                if not isinstance(
-                    s,
-                    (
-                        _StatelessMCPServerReference,
-                        _StatefulMCPServerReference,
-                    ),
-                ):
+                # Checked by mark, not by isinstance. An isinstance tuple must name every
+                # durable server type, so it must import every package that defines one,
+                # including the optional nexus_mcp. The factory sets the mark.
+                if not is_durable_mcp_server(s):
                     raise ValueError(
-                        f"Unknown mcp_server type {type(s)} may not work durably."
+                        f"Unknown mcp_server type {type(s)} may not work durably. "
+                        f"Build it with a harness mcp_server factory."
+                    )
+
+                # Statically assert that MCP servers here are wrapped with
+                # as_harness_mcp_server() so the harness can handle approval and
+                # tool_start/tool_end/tool_error events.
+                if not is_harness_mcp_server(s):
+                    raise ValueError(
+                        f"{type(s).__name__} was not built by a harness mcp_server "
+                        f"factory. Build it with one, or wrap it with "
+                        f"as_harness_mcp_server()."
                     )
 
         if isinstance(kwargs.get("session"), SQLiteSession):

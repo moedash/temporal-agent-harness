@@ -28,32 +28,24 @@ from temporal_agent_harness.nexus_agent_adapter.generated import (
 )
 from temporal_agent_harness.nexus_agent_adapter.generated import (
     ApproveToolCallInput,
-    ExecuteOperatorCommandInput,
     PollMessagesInput,
     QuerySessionInput,
     SendAgentMessageInput,
 )
 from temporal_agent_harness.nexus_agent_adapter.handler import AgentServiceHandler, Config
 
-# Custom dev-server build with the Nexus-update-callback dynamic config surface (matches
-# sdk-python's own tests/conftest.py for PR #1631 — the stock time-skipping test server and
-# ordinary dev-server releases don't have these flags).
-_DEV_SERVER_VERSION = "v1.7.1-system-nexus-operations"
+# The time-skipping test server has no dynamic config, so these run on a real dev server.
+# A stock `temporal` CLI release carries the features; only the flags below need enabling.
 _DEV_SERVER_ARGS = [
     "--dynamic-config-value",
-    "history.enableChasm=true",
-    "--dynamic-config-value",
-    "history.enableTransitionHistory=true",
-    "--dynamic-config-value",
-    "history.enableCHASMCallbacks=true",
-    "--dynamic-config-value",
-    "history.enableCHASMSignalBacklinks=true",
+    "history.enableUpdateCallbacks=true",
     "--dynamic-config-value",
     "nexusoperation.enableStandalone=true",
     "--dynamic-config-value",
-    'system.system.refreshNexusEndpointsMinWait="0s"',
+    "activity.enableStandalone=true",
+    # Endpoint registration is cached; 0s keeps create_nexus_endpoint visible immediately.
     "--dynamic-config-value",
-    "history.enableUpdateCallbacks=true",
+    'system.system.refreshNexusEndpointsMinWait="0s"',
 ]
 
 
@@ -69,7 +61,6 @@ class AskReply(BaseModel):
     text: str
 
 
-@workflow.defn
 @agent.defn
 class ProbeAgent:
     """2s reply delay so pollMessages is provably waiting on a live stream, not a backlog."""
@@ -141,7 +132,6 @@ class CallerWorkflow:
 async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
     env = await WorkflowEnvironment.start_local(
         data_converter=pydantic_data_converter,
-        dev_server_download_version=_DEV_SERVER_VERSION,
         dev_server_extra_args=_DEV_SERVER_ARGS,
     )
     yield env
@@ -161,7 +151,6 @@ async def test_poll_messages_delivers_the_reply(env: WorkflowEnvironment) -> Non
         agent_task_queue=agent_task_queue,
         workflow_name="ProbeAgent",
         workflow_id_prefix="probe-",
-        is_message_queuing_enabled=False,
     )
 
     async with Worker(
@@ -242,7 +231,6 @@ async def test_send_agent_message_survives_handler_worker_restart(
         agent_task_queue=agent_task_queue,
         workflow_name="ProbeAgent",
         workflow_id_prefix="probe-",
-        is_message_queuing_enabled=False,
     )
     session_id = str(uuid.uuid4())
 
@@ -330,7 +318,6 @@ async def test_poll_messages_closed_when_workflow_already_completed(
         agent_task_queue=completed_task_queue,
         workflow_name="ImmediatelyDoneWorkflow",
         workflow_id_prefix="done-",
-        is_message_queuing_enabled=False,
     )
 
     async with Worker(
@@ -367,8 +354,10 @@ async def test_poll_messages_closed_when_workflow_already_completed(
 
 
 # ---------------------------------------------------------------------------
-# Full operation surface — approveToolCall, executeOperatorCommand,
-# queryAgentInterface, queryOperatorInterface, queryAgentStatus.
+# Full operation surface — sendAgentMessage, queryAgentInterface, queryAgentStatus,
+# approveToolCall, pollMessages. (executeOperatorCommand / queryOperatorInterface are
+# NOT exercised: operator commands are gone from the harness and those two operations now
+# answer NOT_IMPLEMENTED until the contract is regenerated without them.)
 # ---------------------------------------------------------------------------
 
 
@@ -378,7 +367,6 @@ async def gated_tool(text: str) -> str:
     return f"tool-result:{text}"
 
 
-@workflow.defn
 @agent.defn
 class GatedProbeAgent:
     """Gates every tool call, unlike ProbeAgent — needed to exercise approveToolCall."""
@@ -387,7 +375,7 @@ class GatedProbeAgent:
     def __init__(self, config: AgentConfig) -> None:
         self._runner = AgentWorkflowRunner(
             config,
-            approval_policy_default=ToolApprovalPolicy.always_require_approvals(),
+            approval_policy_default=ToolApprovalPolicy.always_require_human_approval(),
         )
 
     @workflow.run
@@ -403,17 +391,15 @@ class GatedProbeAgent:
 
 class FullSurfaceOutput(BaseModel):
     handler_names: list[str]
-    operator_command_names: list[str]
     pending_tool_id: str
     approve_accepted: bool
-    status_reply: str
     poll_item_count: int
 
 
 @workflow.defn
 class FullSurfaceCallerWorkflow:
     """Exercises the remaining operations: interface/status queries, approveToolCall,
-    executeOperatorCommand."""
+    pollMessages."""
 
     @workflow.run
     async def run(self, input: CallerInput) -> FullSurfaceOutput:
@@ -433,10 +419,6 @@ class FullSurfaceCallerWorkflow:
 
         iface = await client.execute_operation(
             AgentServiceDefinition.query_agent_interface,
-            QuerySessionInput(session_id=input.session_id),
-        )
-        ops_iface = await client.execute_operation(
-            AgentServiceDefinition.query_operator_interface,
             QuerySessionInput(session_id=input.session_id),
         )
 
@@ -460,11 +442,6 @@ class FullSurfaceCallerWorkflow:
             ),
         )
 
-        status_out = await client.execute_operation(
-            AgentServiceDefinition.execute_operator_command,
-            ExecuteOperatorCommandInput(session_id=input.session_id, name="status"),
-        )
-
         poll_out = await client.execute_operation(
             AgentServiceDefinition.poll_messages,
             PollMessagesInput(
@@ -476,12 +453,94 @@ class FullSurfaceCallerWorkflow:
 
         return FullSurfaceOutput(
             handler_names=sorted(h.name for h in iface.handlers),
-            operator_command_names=sorted(c.name for c in ops_iface.commands),
             pending_tool_id=tool_id,
             approve_accepted=approve_out.accepted,
-            status_reply=status_out.reply,
             poll_item_count=len(poll_out.items),
         )
+
+
+class MalformedCallOutput(BaseModel):
+    error_type: str
+    error_message: str
+
+
+@workflow.defn
+class MalformedInputCallerWorkflow:
+    """Sends session_id=None for a required str field. The generated dataclass has no
+    constructor-time validation (unlike the old pydantic models), so this only gets
+    caught by TransferTypeConverter.from_transfer_type on the handler side, once the
+    value crosses the wire. Proves that boundary still rejects malformed input."""
+
+    @workflow.run
+    async def run(self, input: CallerInput) -> MalformedCallOutput:
+        client = workflow.create_nexus_client(
+            service=AgentServiceDefinition, endpoint=input.endpoint
+        )
+        try:
+            await client.execute_operation(
+                AgentServiceDefinition.send_agent_message,
+                SendAgentMessageInput(
+                    session_id=None,  # type: ignore[arg-type]
+                    msg_type="ask",
+                    payload=json.dumps({"text": "hi"}),
+                ),
+            )
+        except Exception as e:
+            chain = [f"{type(e).__name__}: {e}"]
+            # Protobuf singular message fields are never None when unset (they return
+            # an empty message), so walk with HasField instead of an is-None check.
+            failure = getattr(e, "failure", None)
+            while failure is not None and failure.HasField("cause"):
+                failure = failure.cause
+                chain.append(f"failure.cause: {failure.message}")
+            return MalformedCallOutput(
+                error_type=type(e).__name__, error_message=" | ".join(chain)
+            )
+        raise AssertionError("malformed input should not have succeeded")
+
+
+async def test_send_agent_message_rejects_malformed_input(
+    env: WorkflowEnvironment,
+) -> None:
+    """A required field sent as null over the wire must fail the Nexus call, not crash
+    the handler worker or silently proceed with a bad value."""
+    client = env.client
+    endpoint_name = f"agent-endpoint-{uuid.uuid4()}"
+    agent_task_queue = f"agent-{uuid.uuid4()}"
+    nexus_task_queue = f"nexus-agent-{uuid.uuid4()}"
+    caller_task_queue = f"caller-{uuid.uuid4()}"
+
+    await env.create_nexus_endpoint(endpoint_name, nexus_task_queue)
+
+    # No agent workflow worker needed: input conversion fails before the handler's
+    # send_agent_message body (and therefore AgentClient) ever runs.
+    config = Config(
+        agent_task_queue=agent_task_queue,
+        workflow_name="ProbeAgent",
+        workflow_id_prefix="probe-",
+    )
+
+    async with Worker(
+        client,
+        task_queue=nexus_task_queue,
+        nexus_service_handlers=[AgentServiceHandler(client, config)],
+    ), Worker(
+        client,
+        task_queue=caller_task_queue,
+        workflows=[MalformedInputCallerWorkflow],
+    ):
+        session_id = str(uuid.uuid4())
+        handle = await client.start_workflow(
+            MalformedInputCallerWorkflow.run,
+            CallerInput(endpoint=endpoint_name, session_id=session_id),
+            id=f"malformed-caller-{session_id}",
+            task_queue=caller_task_queue,
+        )
+        result = await handle.result()
+
+        assert result.error_type == "NexusOperationError"
+        assert "sessionId" in result.error_message
+        assert "required" in result.error_message
 
 
 async def test_full_operation_surface(env: WorkflowEnvironment) -> None:
@@ -497,7 +556,6 @@ async def test_full_operation_surface(env: WorkflowEnvironment) -> None:
         agent_task_queue=agent_task_queue,
         workflow_name="GatedProbeAgent",
         workflow_id_prefix="gated-probe-",
-        is_message_queuing_enabled=False,
     )
 
     async with Worker(
@@ -523,8 +581,6 @@ async def test_full_operation_surface(env: WorkflowEnvironment) -> None:
         result = await handle.result()
 
         assert result.handler_names == ["use_tool"]
-        assert "status" in result.operator_command_names
         assert result.pending_tool_id == "fixed-tool-id"
         assert result.approve_accepted
-        assert result.status_reply
         assert result.poll_item_count > 0

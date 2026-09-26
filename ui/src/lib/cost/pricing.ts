@@ -67,7 +67,17 @@ function addUsage(totals: UsageTotals, usage: TokenUsage): void {
   totals.thought += usage.thought_tokens ?? 0;
   totals.cached += usage.cached_tokens ?? 0;
   totals.toolUse += usage.tool_use_tokens ?? 0;
-  totals.total += (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0);
+  /* The five fields above OVERLAP, so their sum is not a token count. `cached` is
+     the slice of `input` the prompt cache served; for the OpenAI and pydantic-ai
+     producers `thought` is likewise the slice of `output` spent reasoning. Gemini
+     instead reports thought and tool-use outside input/output and folds them into
+     its own `total_tokens` ("prompt + responses + other internal tokens"). Only
+     the provider knows which convention it used, which is why the protocol ships
+     a grand total and documents it as "not necessarily the sum of the parts".
+     Falling back to input + output keeps the previous answer for a producer that
+     reports no total of its own. */
+  totals.total +=
+    usage.total_tokens ?? (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0);
 }
 
 function estimate(model: string, tokens: UsageTotals): number | null {
@@ -87,23 +97,79 @@ function timestampOf(frame: AgentSseFrame): number | null {
   return frame.data.timestamp;
 }
 
+interface MeteredUsage {
+  model: string;
+  usage: TokenUsage;
+}
+
+function tokenCount(value: unknown): number | null {
+  return typeof value === "number" &&
+    Number.isFinite(value) &&
+    Number.isInteger(value) &&
+    value >= 0
+    ? value
+    : null;
+}
+
+/**
+ * Every event that closes a model-metered operation.
+ *
+ * Jev runs outside the agent's ordinary model span, so its usage only exists in
+ * the structured audit record on `auto_approval_evaluation_ended`. Reading that
+ * record here keeps the headline, chart, and per-model rows on the same ledger.
+ */
+function meteredUsage(frame: AgentSseFrame): MeteredUsage | null {
+  if (
+    frame.event === "model_interaction_ended" &&
+    "type" in frame.data &&
+    frame.data.usage
+  ) {
+    return { model: frame.data.model ?? "unknown", usage: frame.data.usage };
+  }
+
+  if (frame.event !== "auto_approval_evaluation_ended") return null;
+  const details = frame.data.details;
+  const rawUsage = details.usage;
+  if (typeof rawUsage !== "object" || rawUsage === null || Array.isArray(rawUsage)) {
+    return null;
+  }
+
+  const values = rawUsage as Record<string, unknown>;
+  const usage: TokenUsage = {
+    input_tokens: null,
+    output_tokens: null,
+    thought_tokens: null,
+    cached_tokens: null,
+    tool_use_tokens: null,
+    total_tokens: null
+  };
+  let measured = false;
+  for (const key of Object.keys(usage) as (keyof TokenUsage)[]) {
+    const count = tokenCount(values[key]);
+    if (count === null) continue;
+    usage[key] = count;
+    measured = true;
+  }
+  if (!measured) return null;
+
+  const model =
+    typeof details.model === "string" && details.model.trim().length > 0
+      ? details.model
+      : "unknown";
+  return { model, usage };
+}
+
 export function summarizeCost(frames: AgentSseFrame[]): CostSummary {
   const byModel = new Map<string, UsageTotals>();
   const aggregate = emptyTotals();
 
   for (const frame of frames) {
-    if (
-      frame.event !== "model_interaction_ended" ||
-      !("type" in frame.data) ||
-      !frame.data.usage
-    ) {
-      continue;
-    }
-    const model = frame.data.model ?? "unknown";
-    const totals = byModel.get(model) ?? emptyTotals();
-    addUsage(totals, frame.data.usage);
-    addUsage(aggregate, frame.data.usage);
-    byModel.set(model, totals);
+    const metered = meteredUsage(frame);
+    if (!metered) continue;
+    const totals = byModel.get(metered.model) ?? emptyTotals();
+    addUsage(totals, metered.usage);
+    addUsage(aggregate, metered.usage);
+    byModel.set(metered.model, totals);
   }
 
   const modelBreakdown = [...byModel.entries()].map(([model, tokens]) => ({
@@ -144,17 +210,27 @@ export function buildUsageTimeline(frames: AgentSseFrame[]): UsageTimelinePoint[
   ];
 
   frames.forEach((frame, index) => {
-    if (
-      frame.event === "model_interaction_ended" &&
-      "type" in frame.data &&
-      frame.data.usage
-    ) {
+    const metered = meteredUsage(frame);
+    if (metered) {
       const tokens = emptyTotals();
-      addUsage(tokens, frame.data.usage);
-      addUsage(cumulative, frame.data.usage);
-      const estimatedCostUsd = estimate(frame.data.model ?? "unknown", tokens);
+      addUsage(tokens, metered.usage);
+      addUsage(cumulative, metered.usage);
+      const estimatedCostUsd = estimate(metered.model, tokens);
       if (estimatedCostUsd == null) {
-        hasUnknownCost = true;
+        /* The latch is deliberate and stays: this series is CUMULATIVE, so once a
+           term is missing every later sum is a lower bound rather than a value,
+           and reporting the known part as if it were the whole is a quieter lie
+           than reporting nothing. What is not deliberate is tripping on an
+           interaction that spent nothing — zero tokens cost zero at any price, so
+           it cannot make the running total unknown. Summed field-wise rather than
+           via tokens.total because a provider that reports no grand total of its
+           own still leaves thought and tool-use counts outside that fallback. */
+        if (
+          tokens.input + tokens.output + tokens.thought + tokens.cached + tokens.toolUse >
+          0
+        ) {
+          hasUnknownCost = true;
+        }
       } else {
         cumulativeCost += estimatedCostUsd;
       }
@@ -176,6 +252,19 @@ export function formatCost(cost: number | null): string {
   if (cost == null) return "—";
   if (cost < 0.01) return `$${cost.toFixed(4)}`;
   return `$${cost.toFixed(2)}`;
+}
+
+/** Models in this run that we hold no price for, so their cost is unknown. */
+export function unpricedModels(usage: CostSummary): string[] {
+  return usage.modelBreakdown
+    .filter((item) => item.estimatedCostUsd == null)
+    .map((item) => item.model);
+}
+
+/** Hover text for a cost we could not compute. Null when the cost is real. */
+export function unpricedNote(models: string[]): string | null {
+  if (models.length === 0) return null;
+  return `No price configured for ${models.join(", ")} — token counts are exact, cost is not estimated.`;
 }
 
 export function formatTokens(value: number): string {

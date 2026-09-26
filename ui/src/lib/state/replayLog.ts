@@ -2,15 +2,14 @@ import type {
   AgentEventType,
   AgentSseFrame,
   FileCitationAnnotation,
+  JsonPatchOp,
   JsonRecord,
   ToolId
 } from "$lib/api/types";
-import {
-  formatCost,
-  formatTokens,
-  summarizeCost,
-  type UsageTotals
-} from "$lib/cost/pricing";
+import { formatTokens, summarizeCost, type UsageTotals } from "$lib/cost/pricing";
+import { renderUserMessage } from "$lib/state/inboundMessageText";
+import { HISTORY_GAP_NOTE, findHistoryGaps } from "$lib/state/historyGap";
+import { thoughtDeltaText } from "$lib/state/thoughtSummary";
 
 export type ReplayActor =
   | "user"
@@ -21,7 +20,6 @@ export type ReplayActor =
   | "queue"
   | "reasoning"
   | "subagent"
-  | "operator"
   | "system"
   | "error";
 
@@ -48,7 +46,9 @@ export interface ReplayLogRow {
   sourceLabel?: string;
   turnId: string;
   timestamp: number;
-  event: AgentEventType;
+  // An agent event's own type, or "stream_error" for the client-side frame /api/chat
+  // synthesizes — which no agent published, so it is not an AgentEventType.
+  event: AgentEventType | "stream_error";
   actor: ReplayActor;
   tone: ReplayTone;
   label: string;
@@ -58,13 +58,26 @@ export interface ReplayLogRow {
   model?: string | null;
   toolId?: ToolId;
   toolName?: string;
-  input?: JsonRecord;
+  /** Absent means the frame carried no `tool_input`; `null` means it carried one and it was
+   *  unknown (arguments streamed but unparseable), which is not the same as `{}`. The two
+   *  render differently — see formatLogValue in $lib/state/logValue. */
+  input?: JsonRecord | null;
   output?: string;
   citations: FileCitationAnnotation[];
   usage?: UsageTotals;
   estimatedCostUsd?: number | null;
   marker?: ReplayMarkerTone;
   markerLabel?: string;
+  /**
+   * The run's history is discontinuous immediately BEFORE this row — set to
+   * HISTORY_GAP_NOTE, which is the whole of what is known (see historyGap.ts).
+   *
+   * On the row after the seam rather than the one before it, because the seam is
+   * read going forwards: "what follows is not continuous with what precedes it"
+   * is a statement about this row, and the row before it is a complete event that
+   * nothing is wrong with.
+   */
+  gapBefore?: string;
 }
 
 export interface TurnLogSummary {
@@ -110,37 +123,6 @@ export interface ReplayLogFrame {
   parentTurnNumber?: number;
 }
 
-function renderUserMessage(value: string): string {
-  if (!value.startsWith("{")) return value;
-  try {
-    const message = JSON.parse(value) as {
-      type?: string;
-      payload?: { name?: string; arg?: string; text?: string };
-      script?: string;
-    };
-    if (typeof message.payload?.text === "string") return message.payload.text;
-    if (typeof message.script === "string") return message.script;
-    if (
-      (message.type !== "slash" && message.type !== "slash_command") ||
-      !message.payload?.name
-    ) {
-      return value;
-    }
-    const command = message.payload.name === "set-model" ? "model" : message.payload.name;
-    return `/${command}${message.payload.arg ? ` ${message.payload.arg}` : ""}`;
-  } catch {
-    return value;
-  }
-}
-
-function thoughtText(delta: JsonRecord): string {
-  const content = delta.content;
-  if (typeof content === "object" && content != null && "text" in content) {
-    return String((content as { text?: unknown }).text ?? "");
-  }
-  return "";
-}
-
 function textFromReply(data: { text?: unknown; output?: unknown }): string {
   if (typeof data.text === "string") return data.text;
   const output = data.output;
@@ -176,17 +158,21 @@ function citationBody(citations: FileCitationAnnotation[]): string {
     .join(", ");
 }
 
-function modelUsageBody(usage: UsageTotals, cost: number | null): string {
-  return `${formatTokens(usage.total)} tokens, ${formatCost(cost)}`;
+/**
+ * Which paths one state commit touched, short enough for a log row.
+ *
+ * The paths, not the count: a commit's ops are the whole of what it did, and
+ * "4 ops" says only that something happened. Three of them is enough to tell two
+ * commits apart at a glance; the state pane has the rest, with the values.
+ */
+function stateOpsBody(ops: JsonPatchOp[]): string {
+  const shown = ops.slice(0, 3).map((op) => `${op.op} ${op.path || "/"}`);
+  const rest = ops.length - shown.length;
+  return rest > 0 ? `${shown.join(", ")}, +${rest} more` : shown.join(", ");
 }
 
-function operatorCommandDisplay(data: {
-  command_label: string;
-  command_name: string;
-  arg?: string | null;
-}): string {
-  const label = data.command_label || `/${data.command_name}`;
-  return `${label}${data.arg ? ` ${data.arg}` : ""}`;
+function modelUsageBody(usage: UsageTotals): string {
+  return `${formatTokens(usage.total)} tokens`;
 }
 
 function normalizeReplayLogFrame(item: AgentSseFrame | ReplayLogFrame): ReplayLogFrame {
@@ -210,7 +196,7 @@ function rowFromFrame(
       sourceLabel: entry.label,
       turnId: "client",
       timestamp: 0,
-      event: "error",
+      event: "stream_error",
       actor: "error",
       tone: "error",
       label: "Stream error",
@@ -241,62 +227,42 @@ function rowFromFrame(
     citations: [] as FileCitationAnnotation[]
   };
 
+  if (frame.event === "message_accepted") {
+    // One row for every admitted message, labelled by what it did to the turn — the queued
+    // case is no longer a separate event, and "joined" is a case the old vocabulary could not
+    // express at all.
+    const queued = frame.data.disposition === "queued";
+    return {
+      ...base,
+      actor: queued ? "queue" : "user",
+      tone: "queue",
+      label:
+        frame.data.disposition === "joined"
+          ? "Message joined the open turn"
+          : queued
+            ? "Message queued"
+            : "User message received",
+      body: renderUserMessage(frame.data.handler, frame.data.payload),
+      marker: queued ? "queue" : undefined,
+      markerLabel: queued ? "queued turn" : undefined
+    };
+  }
+
   if (frame.event === "turn_started") {
     return {
       ...base,
-      actor: "user",
-      tone: "queue",
-      label: "User message received",
-      body: renderUserMessage(frame.data.user_message)
+      actor: "system",
+      tone: "neutral",
+      label: "Turn started"
     };
   }
 
-  if (frame.event === "message_queued") {
+  if (frame.event === "message_handler_start") {
     return {
       ...base,
-      actor: "queue",
-      tone: "queue",
-      label: "Message queued",
-      body: renderUserMessage(frame.data.user_message),
-      marker: "queue",
-      markerLabel: "queued turn"
-    };
-  }
-
-  if (frame.event === "operator_command_started") {
-    return {
-      ...base,
-      actor: "operator",
-      tone: "queue",
-      label: "Operator command started",
-      body: operatorCommandDisplay(frame.data),
-      status: "running"
-    };
-  }
-
-  if (frame.event === "operator_command_completed") {
-    return {
-      ...base,
-      actor: "operator",
-      tone: "done",
-      label: "Operator command completed",
-      body: frame.data.text,
-      detail: operatorCommandDisplay(frame.data),
-      status: "completed"
-    };
-  }
-
-  if (frame.event === "operator_command_failed") {
-    return {
-      ...base,
-      actor: "operator",
-      tone: "error",
-      label: "Operator command failed",
-      body: frame.data.message,
-      detail: operatorCommandDisplay(frame.data),
-      status: "failed",
-      marker: "error",
-      markerLabel: "operator command failed"
+      actor: "system",
+      tone: "neutral",
+      label: "Handler started"
     };
   }
 
@@ -319,7 +285,7 @@ function rowFromFrame(
       actor: "model",
       tone: "done",
       label: "Model completed",
-      body: modelUsageBody(summary.tokens, summary.estimatedCostUsd),
+      body: modelUsageBody(summary.tokens),
       model: frame.data.model,
       status: "completed",
       usage: summary.tokens,
@@ -354,6 +320,78 @@ function rowFromFrame(
       status: "awaiting",
       marker: "approval",
       markerLabel: "approval requested"
+    };
+  }
+
+  if (frame.event === "auto_approval_evaluation_started") {
+    return {
+      ...base,
+      actor: "approval",
+      tone: "approval",
+      label: "Approval check started",
+      body: `${frame.data.evaluator} · ${frame.data.tool_name}`,
+      toolId: frame.data.tool_id,
+      toolName: frame.data.tool_name,
+      status: "awaiting",
+      marker: "approval",
+      markerLabel: "approval check"
+    };
+  }
+
+  if (frame.event === "auto_approval_evaluation_ended") {
+    const verdict = frame.data.verdict;
+    /* An escalate is not a failure — it is the evaluator correctly declining to decide —
+       so it reads as "approval" (still pending a human), not as an error. */
+    const tone: ReplayTone =
+      verdict === "approve" ? "done" : verdict === "deny" ? "error" : "approval";
+    const details = frame.data.details;
+    return {
+      ...base,
+      actor: "approval",
+      tone,
+      label: `Approval check: ${verdict}`,
+      body: frame.data.reason ?? undefined,
+      /* The evaluator's structured reasoning, rendered as JSON — this is the whole audit
+         record of an automatic decision, and for an escalate it is the only one. */
+      detail:
+        details && Object.keys(details).length > 0
+          ? JSON.stringify(details, null, 2)
+          : undefined,
+      toolId: frame.data.tool_id,
+      toolName: frame.data.tool_name,
+      status: verdict === "approve" ? "approved" : verdict === "deny" ? "denied" : "awaiting"
+    };
+  }
+
+  if (frame.event === "auto_approval_evaluation_superseded") {
+    return {
+      ...base,
+      actor: "approval",
+      /* Neutral, not an error: nothing went wrong — the answer simply arrived from
+         somewhere else first, and the evaluator was stopped rather than left running. */
+      tone: "neutral",
+      label: "Approval check cancelled",
+      body: frame.data.verdict
+        ? `the gate was decided first; it had reached "${frame.data.verdict}"`
+        : "the gate was decided first",
+      toolId: frame.data.tool_id,
+      toolName: frame.data.tool_name,
+      status: "superseded"
+    };
+  }
+
+  if (frame.event === "auto_approval_evaluation_error") {
+    return {
+      ...base,
+      actor: "approval",
+      tone: "error",
+      label: "Approval check failed",
+      body: frame.data.message,
+      toolId: frame.data.tool_id,
+      toolName: frame.data.tool_name,
+      status: "awaiting",
+      marker: "error",
+      markerLabel: "approval check failed"
     };
   }
 
@@ -447,7 +485,7 @@ function rowFromFrame(
       actor: "subagent",
       tone: "tool",
       label: "Subagent message sent",
-      body: `${frame.data.function} → turn ${frame.data.subagent_turn}`,
+      body: `${frame.data.handler} → turn ${frame.data.subagent_turn}`,
       detail: `${frame.data.agent_key} · ${frame.data.subagent_id}`,
       status: "dispatched"
     };
@@ -459,7 +497,7 @@ function rowFromFrame(
       actor: "subagent",
       tone: frame.data.outcome === "ok" ? "done" : "error",
       label: "Subagent reply received",
-      body: `${frame.data.function} → turn ${frame.data.subagent_turn}`,
+      body: `${frame.data.handler} → turn ${frame.data.subagent_turn}`,
       detail: `${frame.data.agent_key} · ${frame.data.subagent_id}`,
       status: frame.data.outcome
     };
@@ -497,7 +535,7 @@ function rowFromFrame(
       actor: "reasoning",
       tone: "model",
       label: "Reasoning summary",
-      body: thoughtText(frame.data.delta)
+      body: thoughtDeltaText(frame.data.delta)
     };
   }
 
@@ -524,12 +562,12 @@ function rowFromFrame(
     };
   }
 
-  if (frame.event === "reply") {
+  if (frame.event === "message_handler_end") {
     return {
       ...base,
       actor: "agent",
       tone: "done",
-      label: "Final reply",
+      label: "Handler reply",
       body: textFromReply(frame.data),
       status: "complete"
     };
@@ -545,15 +583,41 @@ function rowFromFrame(
     };
   }
 
-  if (frame.event === "error") {
+  if (frame.event === "message_handler_error") {
     return {
       ...base,
       actor: "error",
       tone: "error",
-      label: "Agent error",
+      label: "Handler error",
       body: frame.data.message,
       marker: "error",
-      markerLabel: "agent error"
+      markerLabel: "handler error"
+    };
+  }
+
+  /* State rides this stream rather than a topic of its own precisely so that a
+     commit is ORDERED against the tool call and the reply delta around it. Rows
+     here are what cashes that in: leave them out and the log quietly asserts
+     that nothing happened between two model calls. */
+  if (frame.event === "state_snapshot") {
+    return {
+      ...base,
+      actor: "system",
+      tone: "neutral",
+      label: "State registered",
+      body: frame.data.state_id,
+      status: `v${frame.data.version}`
+    };
+  }
+
+  if (frame.event === "state_patch") {
+    return {
+      ...base,
+      actor: "system",
+      tone: "neutral",
+      label: "State changed",
+      body: `${frame.data.state_id} — ${stateOpsBody(frame.data.ops ?? [])}`,
+      status: `v${frame.data.version}`
     };
   }
 
@@ -585,9 +649,22 @@ function buildSummary(turnNumber: number, rows: ReplayLogRow[]): TurnLogSummary 
 }
 
 export function buildReplayLog(input: Array<AgentSseFrame | ReplayLogFrame>): ReplayLog {
-  const rows = input
-    .map((item, index) => rowFromFrame(normalizeReplayLogFrame(item), index))
-    .filter((row): row is ReplayLogRow => row != null);
+  const gapPositions = findHistoryGaps(input);
+  /* Carried forward for the same reason the waterfall carries it: `rowFromFrame`
+     answers null for an event kind this log does not render, and a seam attached to
+     a frame that draws no row would never be seen. */
+  let pendingGap = false;
+  const rows: ReplayLogRow[] = [];
+  input.forEach((item, index) => {
+    if (gapPositions.has(index)) pendingGap = true;
+    const row = rowFromFrame(normalizeReplayLogFrame(item), index);
+    if (!row) return;
+    if (pendingGap) {
+      row.gapBefore = HISTORY_GAP_NOTE;
+      pendingGap = false;
+    }
+    rows.push(row);
+  });
 
   const groupedRows = new Map<number, ReplayLogRow[]>();
   for (const row of rows) {
@@ -608,8 +685,8 @@ export function buildReplayLog(input: Array<AgentSseFrame | ReplayLogFrame>): Re
   return { rows, groups };
 }
 
-export function buildReplayMarkers(input: Array<AgentSseFrame | ReplayLogFrame>): ReplayMarker[] {
-  return buildReplayLog(input).rows
+export function buildReplayMarkers(log: ReplayLog): ReplayMarker[] {
+  return log.rows
     .filter((row) => row.marker)
     .map((row) => ({
       id: `marker-${row.ordinal}`,
@@ -620,8 +697,60 @@ export function buildReplayMarkers(input: Array<AgentSseFrame | ReplayLogFrame>)
     }));
 }
 
+/* Most statuses restate the label they sit next to ("Tool completed" carries
+   status "done"), so a status has to survive these stems before it is worth
+   showing. Unknown values like a subagent's "timeout" fall through and stay. */
+const IMPLIED_STATUS_STEMS: Record<string, string[]> = {
+  running: ["start", "progress", "stream"],
+  done: ["complet", "final"],
+  complete: ["complet", "final"],
+  idle: ["end"],
+  dispatched: ["sent"],
+  approved: ["grant"],
+  awaiting: ["request"],
+  degraded: ["unavailable"]
+};
+
+/** The row's status, or null when the row's label already carries it. */
+export function statusNote(row: ReplayLogRow): string | null {
+  const status = row.status?.trim();
+  if (!status) return null;
+  const label = row.label.toLowerCase();
+  const value = status.toLowerCase();
+  if (label.includes(value)) return null;
+  if ((IMPLIED_STATUS_STEMS[value] ?? []).some((stem) => label.includes(stem))) return null;
+  return status;
+}
+
+/* Minutes have to roll over into hours: a session left open for three hours read as
+   "200m 05s", which is arithmetically right and useless to a reader. */
 export function formatDuration(seconds: number): string {
   const rounded = Math.max(0, Math.round(seconds));
   if (rounded < 60) return `${rounded}s`;
-  return `${Math.floor(rounded / 60)}m ${String(rounded % 60).padStart(2, "0")}s`;
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const minutes = Math.floor(rounded / 60);
+  if (minutes < 60) return `${minutes}m ${pad(rounded % 60)}s`;
+  return `${Math.floor(minutes / 60)}h ${pad(minutes % 60)}m ${pad(rounded % 60)}s`;
+}
+
+/**
+ * The same reading at the resolution one step is watched at, rather than a run.
+ *
+ * Two things are this function's own, and only two. Below a second it answers in
+ * milliseconds, and between one and ten it keeps a tenth — a tool call that took
+ * 2.4s is not a 2s one, and the activity feed is read at that resolution. From ten
+ * seconds up there is nothing here formatDuration does not already own.
+ *
+ * It used to restate the minutes branch instead of delegating, and stopped there,
+ * so a three-hour turn read "200m 05s" in the feed for as long as it took anyone
+ * to notice — the exact bug formatDuration above was written to fix, reintroduced
+ * one component over by copying half of it.
+ */
+export function formatElapsedDuration(deltaMs: number): string {
+  if (deltaMs < 1000) return `${Math.max(1, Math.round(deltaMs))}ms`;
+
+  const seconds = deltaMs / 1000;
+  const tenths = Math.round(seconds * 10) / 10;
+  if (seconds < 10 && !Number.isInteger(tenths)) return `${tenths.toFixed(1)}s`;
+  return formatDuration(seconds);
 }

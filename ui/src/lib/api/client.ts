@@ -1,14 +1,11 @@
 import type {
-  AcceptedMessageTypesResponse,
   AgentInterfaceFunction,
+  AgentStatusResponse,
   AgentRegistryResponse,
   AgentSseFrame,
   ChatRequest,
   CreateSessionRequest,
   CreateSessionResponse,
-  OperatorCommand,
-  OperatorCommandRequest,
-  OperatorCommandResponse,
   ResumePoint,
   Session,
   SubmitMessageResponse,
@@ -23,10 +20,15 @@ export interface AgentApi {
   listSessions(): Promise<Session[]>;
   createSession(request: CreateSessionRequest): Promise<CreateSessionResponse>;
   workflowStatus(workflowId: WorkflowId): Promise<WorkflowExecutionState>;
-  acceptedMessageTypes(sessionId: WorkflowId): Promise<AcceptedMessageTypesResponse>;
   agentInterface(sessionId: WorkflowId): Promise<AgentInterfaceFunction[]>;
-  operatorInterface(sessionId: WorkflowId): Promise<OperatorCommand[]>;
-  executeOperatorCommand(request: OperatorCommandRequest): Promise<OperatorCommandResponse>;
+  agentStatus(sessionId: WorkflowId): Promise<AgentStatusResponse>;
+  /**
+   * Stop an agent via the harness `close` signal: it winds down its turn loop, drains
+   * in-flight work, and auto-denies pending approvals/callbacks. This is a first-class
+   * control-plane action, not a message — it is deliberately NOT an agent handler, so it
+   * works on any agent regardless of what it accepts.
+   */
+  closeSession(sessionId: WorkflowId): Promise<void>;
   attach(sessionId: WorkflowId, resume?: ResumePoint, signal?: AbortSignal): AsyncIterable<AgentSseFrame>;
   submitMessage(request: ChatRequest, signal?: AbortSignal): Promise<SubmitMessageResponse>;
   chat(request: ChatRequest, signal?: AbortSignal): AsyncIterable<AgentSseFrame>;

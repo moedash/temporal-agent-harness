@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 
@@ -29,12 +30,12 @@ from temporal_agent_harness.harness.agent_protocol import (
     AgentEventType,
     AgentMessage,
     AgentMessageReply,
+    MessageDisposition,
 )
-from temporal_agent_harness.harness.subagent_activities import SubagentActivities
+from temporal_agent_harness.plugin import AgentHarnessPlugin
 
 from temporal_agent_harness.harness.agent_client import AgentClient
-
-from temporal_agent_harness.harness.code_mode.activities import CODE_MODE_ACTIVITIES
+from temporal_agent_harness.harness.stream_transport import latest_turn_event
 
 from examples.monty import activities
 from examples.monty.workflow import MontyDynamicAgentWorkflow
@@ -51,9 +52,9 @@ async def client_and_queue():
     )
     task_queue = f"subagent-e2e-{uuid.uuid4()}"
     # One worker hosts BOTH the parent and the child agent (the parent starts the child on this
-    # same queue), the Monty batch + host activities the child needs, and the subagent-turn
-    # activity the parent's runner dispatches — closed over the env client so it can talk to the
-    # child workflow.
+    # same queue). The harness plugin supplies everything else: the Monty batch + host
+    # activities the child needs, and the subagent-turn activity the parent's runner dispatches
+    # — the latter bound to this worker's client so it can talk to the child workflow.
     async with Worker(
         env.client,
         task_queue=task_queue,
@@ -62,11 +63,7 @@ async def client_and_queue():
             ApprovalGatedSubagentParentWorkflow,
             MontyDynamicAgentWorkflow,
         ],
-        activities=[
-            *activities.ALL_ACTIVITIES,
-            *CODE_MODE_ACTIVITIES,
-            SubagentActivities(env.client).run_subagent_turn,
-        ],
+        plugins=[AgentHarnessPlugin(tools=activities.ALL_TOOLS)],
     ):
         try:
             yield env.client, task_queue
@@ -95,7 +92,6 @@ async def _drive(
                 "scripts": scripts,
                 "concurrent": concurrent,
             },
-            expected_turn=1,
         ),
         result_type=AgentMessageReply,
     )
@@ -104,7 +100,7 @@ async def _drive(
     events: list[AgentEvent] = []
     async for envelope in turn_events(client, handle.id):
         events.append(envelope)
-        if envelope.event.type == AgentEventType.REPLY:
+        if envelope.event.type == AgentEventType.MESSAGE_HANDLER_END:
             reply = envelope.event.output.get("text")
         if envelope.event.type == AgentEventType.TURN_END:
             break
@@ -152,7 +148,7 @@ async def test_parent_drives_subagent_across_sequential_turns(client_and_queue):
     assert len(messaged) == 2
     assert all(m.subagent_id == started[0].subagent_id for m in messaged)
     assert all(m.workflow_id == started[0].workflow_id for m in messaged)
-    assert all(m.function == "run_script" for m in messaged)
+    assert all(m.handler == "run_script" for m in messaged)
     assert [m.subagent_turn for m in messaged] == [1, 2]
 
 
@@ -217,7 +213,6 @@ async def _merged_send(
     stream = await agent_client.send_message(
         "drive",
         {"task_queue": task_queue, "scripts": scripts, "stop": stop},
-        expected_turn=1,
         on_item=lambda item, _seq: item,
         timeout=None,
     )
@@ -309,9 +304,21 @@ async def test_merged_send_message_nests_live_subagent_events_in_brackets(client
     _assert_subagent_turns_nested_in_brackets(merged, expected_child_turns=2)
 
 
-async def test_operator_command_can_target_live_subagent_directly(client_and_queue):
+async def test_human_can_message_a_live_subagent_directly(client_and_queue):
+    """A human/operator can drive a LIVE subagent through the ordinary front door.
+
+    There is no side channel to reach a child with: every control is an ``@agent.accepts``
+    handler, so addressing a subagent means sending it a normal ``send_agent_message`` at its
+    own ``workflow_id`` — which the parent advertises on ``subagent_started``. The child's
+    resulting turn events must land on the CHILD's stream stamped with the child's own
+    ``agent_id`` (the handle its parent knows it by), so a UI merging both streams can
+    attribute them correctly.
+
+    And the parent is unaffected by it: turn state is the child's own, so after the human's
+    turn the parent's next send to the same child runs as the turn after that.
+    """
     client, task_queue = client_and_queue
-    _parent_id, merged = await _merged_send(
+    parent_id, merged = await _merged_send(
         client, task_queue, [_const_script(42)], stop=False
     )
     started = [
@@ -321,26 +328,78 @@ async def test_operator_command_can_target_live_subagent_directly(client_and_que
     child_workflow_id = started[0].event.workflow_id
     child_agent_id = started[0].event.subagent_id
 
+    # The parent already drove turn 1 through the subagent-turn activity, so ours is turn 2.
     child_client = AgentClient(client, child_workflow_id)
-    result = await child_client.execute_operator_command("status")
+    since = await latest_turn_event(client, child_workflow_id)
+    reply = await child_client.submit_message("run_script", {"script": _const_script(7)})
+    assert reply.turn_number == 2
 
-    operator_events: list[AgentEvent] = []
-    async for envelope in turn_events(client, child_workflow_id):
-        if envelope.event.type in {
-            AgentEventType.OPERATOR_COMMAND_STARTED,
-            AgentEventType.OPERATOR_COMMAND_COMPLETED,
-        }:
-            operator_events.append(envelope)
-        if envelope.event.type == AgentEventType.OPERATOR_COMMAND_COMPLETED:
+    own_turn: list[AgentEvent] = []
+    async for envelope in turn_events(client, child_workflow_id, after=since):
+        if envelope.turn_id != reply.turn_id:
+            continue
+        own_turn.append(envelope)
+        if envelope.event.type == AgentEventType.TURN_END:
             break
 
-    assert [e.event.type for e in operator_events] == [
-        AgentEventType.OPERATOR_COMMAND_STARTED,
-        AgentEventType.OPERATOR_COMMAND_COMPLETED,
+    # Admission comes first and carries what we sent; the turn bracket opens after it. One
+    # bracket, opened and closed exactly once — the child ran our message as its own turn, and
+    # turn_end is the terminal (there is no operator-command terminal any more).
+    types = [e.event.type for e in own_turn]
+    assert types[0] == AgentEventType.MESSAGE_ACCEPTED
+    assert types[1] == AgentEventType.TURN_STARTED
+    assert types[-1] == AgentEventType.TURN_END
+    assert sum(t == AgentEventType.TURN_END for t in types) == 1
+    assert all(e.agent_id == child_agent_id for e in own_turn)
+    assert all(e.turn_number == reply.turn_number for e in own_turn)
+
+    accepted = own_turn[0].event
+    assert accepted.handler == "run_script"
+    assert accepted.disposition is MessageDisposition.OPENED
+    assert accepted.payload == {"script": _const_script(7)}
+
+    # EVERY event of our dispatch is stamped with the id the submit handed back — that is what
+    # a client uses to tell its own work apart from anything else sharing the turn. The two
+    # brackets are deliberately unattributed: they are the TURN's, not this message's.
+    assert reply.message_id
+    for e in own_turn:
+        expected = (
+            None
+            if e.event.type in (AgentEventType.TURN_STARTED, AgentEventType.TURN_END)
+            else reply.message_id
+        )
+        assert e.message_id == expected, e.event.type
+
+    replies = [e.event for e in own_turn if e.event.type == AgentEventType.MESSAGE_HANDLER_END]
+    assert len(replies) == 1
+    assert "7" in json.dumps(replies[0].output)
+
+    # Now the PARENT addresses the same child again. Its send lands as the child's turn 3,
+    # after the human's — and the parent gets the reply, not a rejection.
+    parent_client = AgentClient(client, parent_id)
+    parent_events: list[AgentEvent] = []
+    stream = await parent_client.send_message(
+        "drive_existing",
+        {"subagent_id": child_agent_id, "scripts": [_const_script(9)]},
+        on_item=lambda item, _seq: item,
+        timeout=None,
+    )
+    async for item in stream:
+        if isinstance(item, AgentEvent):
+            parent_events.append(item)
+    parent_replies = [
+        e.event
+        for e in parent_events
+        if e.event.type == AgentEventType.MESSAGE_HANDLER_END
+        and e.agent_id != child_agent_id
     ]
-    assert all(e.agent_id == child_agent_id for e in operator_events)
-    assert operator_events[-1].event.command_name == "status"
-    assert operator_events[-1].event.text == result.text
+    assert len(parent_replies) == 1
+    assert "9" in json.dumps(parent_replies[0].output)
+    sent = [
+        e.event for e in parent_events if e.event.type == AgentEventType.SUBAGENT_MESSAGE_SENT
+    ]
+    assert [s.subagent_turn for s in sent] == [3]
+    assert (await child_client.get_status()).current_turn == 3
 
 
 async def test_attach_after_stopped_subagent_degrades_gracefully(client_and_queue):
@@ -398,7 +457,7 @@ async def test_attach_after_stopped_subagent_degrades_gracefully(client_and_queu
 
 async def test_gated_concurrent_dispatches_get_distinct_turn_numbers(client_and_queue):
     # Reproduction of the real conversational agent's path: two sends dispatched concurrently
-    # through the GENERATED tool under always_require_approvals, each gated on a real approval
+    # through the GENERATED tool under always_require_human_approval, each gated on a real approval
     # BEFORE its body runs take_ticket. Even so, the two SubagentMessageSent events must carry
     # DISTINCT child turn numbers (1, then 2) — the bug report was both showing turn 1.
     client, task_queue = client_and_queue
@@ -416,7 +475,6 @@ async def test_gated_concurrent_dispatches_get_distinct_turn_numbers(client_and_
                 "task_queue": task_queue,
                 "scripts": [_const_script(7), _const_script(13)],
             },
-            expected_turn=1,
         ),
         result_type=AgentMessageReply,
     )

@@ -66,8 +66,8 @@ def test_packaged_ui_dist_contains_relative_vite_entrypoints() -> None:
         assert (dist / asset_path).is_file()
 
 
-def test_just_server_app_serves_packaged_svelte_ui() -> None:
-    from examples.app import create_app
+def test_app_built_from_a_registry_path_serves_packaged_svelte_ui() -> None:
+    from temporal_agent_harness.web.serve import create_app
 
     app = create_app(ROOT / "examples" / "monty" / "agents.toml")
     client = TestClient(app)
@@ -110,7 +110,6 @@ def test_chat_request_rejects_client_supplied_from_offset() -> None:
         json={
             "session_id": "agent-session-test",
             "message": "hello",
-            "expected_turn": 1,
             "from_offset": 42,
         },
     )
@@ -198,26 +197,7 @@ def test_submit_message_request_rejects_client_supplied_from_offset() -> None:
         json={
             "session_id": "agent-session-test",
             "message": "hello",
-            "expected_turn": 1,
             "from_offset": 42,
-        },
-    )
-
-    assert response.status_code == 422
-    detail = response.json()["detail"]
-    assert any("from_offset" in item.get("loc", []) for item in detail)
-
-
-def test_operator_command_request_rejects_client_supplied_from_offset() -> None:
-    app = create_agent_harness_app(registry=AgentRegistry())
-    client = TestClient(app)
-
-    response = client.post(
-        "/api/operator-commands",
-        json={
-            "session_id": "agent-session-test",
-            "name": "status",
-            "from_offset": 10,
         },
     )
 
@@ -235,7 +215,7 @@ def test_legacy_session_manager_example_folder_is_removed() -> None:
 def test_create_session_manager_worker_registers_packaged_workflow() -> None:
     client = object()
 
-    with patch("temporal_agent_harness.web.worker.Worker") as worker_cls:
+    with patch("temporal_agent_harness.web.session_manager_worker.Worker") as worker_cls:
         worker = create_session_manager_worker(client, identity="session-manager-test")
 
     assert worker is worker_cls.return_value
@@ -250,7 +230,7 @@ def test_create_session_manager_worker_registers_packaged_workflow() -> None:
 def test_create_session_manager_worker_allows_custom_task_queue() -> None:
     client = object()
 
-    with patch("temporal_agent_harness.web.worker.Worker") as worker_cls:
+    with patch("temporal_agent_harness.web.session_manager_worker.Worker") as worker_cls:
         create_session_manager_worker(client, task_queue="custom-session-manager")
 
     worker_cls.assert_called_once_with(
@@ -304,7 +284,6 @@ async def test_session_execution_state_reports_completed_workflow_closed() -> No
         created_at=123.0,
         label="Session 1",
         agent_workflow_type="TestAgent",
-        is_message_queuing_enabled=True,
     )
 
     result = await _session_with_execution_state(temporal, session)
@@ -314,7 +293,6 @@ async def test_session_execution_state_reports_completed_workflow_closed() -> No
         "created_at": 123.0,
         "label": "Session 1",
         "agent_workflow_type": "TestAgent",
-        "is_message_queuing_enabled": True,
         "is_discovered": False,
         "execution_status": "COMPLETED",
         "closed": True,
@@ -326,7 +304,6 @@ async def test_session_execution_state_includes_initial_user_message() -> None:
         AgentMessage(
             type="ask",
             payload={"text": "Seven Nation Army"},
-            expected_turn=1,
         )
     )
     handle = _FakeWorkflowHandle(
@@ -339,7 +316,6 @@ async def test_session_execution_state_includes_initial_user_message() -> None:
         created_at=123.0,
         label="Session 1",
         agent_workflow_type="TestAgent",
-        is_message_queuing_enabled=True,
     )
 
     result = await _session_with_execution_state(temporal, session)
@@ -549,9 +525,16 @@ def test_built_distributions_include_packaged_ui_assets(
     with zipfile.ZipFile(wheel_path) as wheel:
         names = set(wheel.namelist())
         _assert_ui_assets_present(names)
-        assert "temporal_agent_harness/web/worker.py" in names
+        assert "temporal_agent_harness/web/session_manager_worker.py" in names
 
-        metadata = wheel.read("temporal_agent_harness-0.1.0.dist-info/METADATA").decode()
+        # The dist-info directory name embeds the package version, so match it rather than
+        # hardcoding it — cutting a release shouldn't require editing this test.
+        (metadata_name,) = [
+            name
+            for name in names
+            if re.fullmatch(r"temporal_agent_harness-[^/]+\.dist-info/METADATA", name)
+        ]
+        metadata = wheel.read(metadata_name).decode()
         assert "Provides-Extra: ui" in metadata
         assert 'Requires-Dist: fastapi[standard]>=0.136.3; extra == "ui"' in metadata
 
@@ -561,7 +544,7 @@ def test_built_distributions_include_packaged_ui_assets(
 
     with tarfile.open(sdist_path) as sdist:
         names = set(sdist.getnames())
-        assert any(name.endswith("/temporal_agent_harness/web/worker.py") for name in names)
+        assert any(name.endswith("/temporal_agent_harness/web/session_manager_worker.py") for name in names)
         assert any(name.endswith("/temporal_agent_harness/ui/dist/index.html") for name in names)
         assert any(name.endswith("/temporal_agent_harness/ui/dist/temporal-logo.svg") for name in names)
         assert any(
@@ -572,6 +555,56 @@ def test_built_distributions_include_packaged_ui_assets(
             name.endswith(".css") and "/temporal_agent_harness/ui/dist/assets/" in name
             for name in names
         )
+
+
+def test_built_distributions_expose_ui_server_console_script(
+    built_distributions: tuple[Path, Path],
+) -> None:
+    """The prebuilt UI must be runnable straight from an install, not just from a checkout."""
+    wheel_path, _ = built_distributions
+
+    with zipfile.ZipFile(wheel_path) as wheel:
+        names = set(wheel.namelist())
+        # The CLI is parsing only; the work it dispatches to must ship alongside it.
+        for module in (
+            "temporal_agent_harness/web/cli.py",
+            "temporal_agent_harness/web/serve.py",
+            "temporal_agent_harness/web/client.py",
+            "temporal_agent_harness/web/session_manager_worker.py",
+        ):
+            assert module in names
+
+        (entry_points_name,) = [
+            name
+            for name in names
+            if re.fullmatch(r"temporal_agent_harness-[^/]+\.dist-info/entry_points.txt", name)
+        ]
+        entry_points = wheel.read(entry_points_name).decode()
+
+    assert "[console_scripts]" in entry_points
+    assert "temporal-agent-harness = temporal_agent_harness.web.cli:main" in entry_points
+
+
+def test_built_distributions_exclude_the_nexus_source_tree(
+    built_distributions: tuple[Path, Path],
+) -> None:
+    """Nothing under the repo's top-level ``nexus/`` directory may ship in the package.
+
+    ``nexus/`` holds the separate Go/Nexus projects (``nexus/mcp`` is wired in only as a
+    workspace-local editable source for the ``nexus-mcp`` extra), so neither distribution should
+    carry any of it. In-package modules whose *names* contain "nexus" — e.g.
+    ``temporal_agent_harness/nexus_agent_adapter/`` — are part of the harness and do ship.
+    """
+    wheel_path, sdist_path = built_distributions
+
+    with zipfile.ZipFile(wheel_path) as wheel:
+        wheel_names = set(wheel.namelist())
+    with tarfile.open(sdist_path) as sdist:
+        # sdist members are prefixed with "<name>-<version>/"; strip it before checking.
+        sdist_names = {name.split("/", 1)[-1] for name in sdist.getnames()}
+
+    for names in (wheel_names, sdist_names):
+        assert not [name for name in names if name.startswith("nexus/")]
 
 
 def test_extracted_wheel_can_resolve_packaged_ui_dist(

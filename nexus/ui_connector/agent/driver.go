@@ -21,6 +21,10 @@ const (
 	// AgentNexusEndpoint is the Nexus endpoint name the driver targets.
 	AgentNexusEndpoint = "support-agent-nexus"
 	turnEventsTopic    = "turn_events"
+
+	// DefaultExistingSessionQueryTimeout is used when
+	// Driver.ExistingSessionQueryTimeout is unset.
+	DefaultExistingSessionQueryTimeout = 30 * time.Second
 )
 
 // derefOrZero returns *p, or the zero value of T if p is nil. This utility
@@ -97,11 +101,13 @@ func turnEventToDelta(e turnEvent) *router.Delta {
 		if citations := extractCitations(e.Delta); len(citations) > 0 {
 			return &router.Delta{Citations: citations}
 		}
-	case "reply":
-		// Text was already fully streamed via reply_delta events; this just signals completion.
+	case "turn_end":
+		// Every message in the turn has finished. The text already arrived as
+		// reply_delta events, so this only ends the stream.
 		return &router.Delta{IsFinal: true}
-	case "error":
-		return &router.Delta{Text: "[error] " + e.Message, IsFinal: true}
+	case "message_handler_error":
+		// Ends one message, not the turn. turn_end still follows.
+		return &router.Delta{Text: "[error] " + e.Message}
 	case "tool_approval_requested":
 		// Tool approval gates surface as a delta with no text; the approval workflow
 		// (started by the interaction webhook) later calls approveToolCall, which
@@ -164,6 +170,11 @@ type Driver struct {
 	// Cloud account — Nexus endpoint names must be unique account-wide, not
 	// just namespace-wide, so each environment needs its own.
 	NexusEndpoint string
+
+	// ExistingSessionQueryTimeout bounds the QueryAgentStatus probe in
+	// StartTurn's RequiresExistingSession branch. Leave zero to use
+	// DefaultExistingSessionQueryTimeout.
+	ExistingSessionQueryTimeout time.Duration
 }
 
 // nexusEndpoint returns d.NexusEndpoint, or AgentNexusEndpoint if unset.
@@ -172,6 +183,15 @@ func (d *Driver) nexusEndpoint() string {
 		return AgentNexusEndpoint
 	}
 	return d.NexusEndpoint
+}
+
+// existingSessionQueryTimeout returns d.ExistingSessionQueryTimeout, or
+// DefaultExistingSessionQueryTimeout if unset.
+func (d *Driver) existingSessionQueryTimeout() time.Duration {
+	if d.ExistingSessionQueryTimeout == 0 {
+		return DefaultExistingSessionQueryTimeout
+	}
+	return d.ExistingSessionQueryTimeout
 }
 
 // StartTurn dispatches a message, slash command, or approval decision to the agent
@@ -186,8 +206,8 @@ func (d *Driver) StartTurn(ctx workflow.Context, input router.Input) (router.Sta
 			// live session for this thread by probing with a query.
 			var statusOut harnessgen.AgentStatusOutput
 			if err := agentClient.ExecuteOperation(ctx, harnessgen.AgentService.QueryAgentStatus,
-				harnessgen.QuerySessionInput{SessionID: input.SessionID},
-				workflow.NexusOperationOptions{ScheduleToCloseTimeout: 10 * time.Second},
+				harnessgen.QuerySessionInput{SessionId: input.SessionID},
+				workflow.NexusOperationOptions{ScheduleToCloseTimeout: d.existingSessionQueryTimeout()},
 			).Get(ctx, &statusOut); err != nil {
 				return router.StartResult{}, nil
 			}
@@ -200,7 +220,7 @@ func (d *Driver) StartTurn(ctx workflow.Context, input router.Input) (router.Sta
 		}
 		return router.StartResult{Handle: &router.TurnHandle{
 			SessionID:  input.SessionID,
-			TurnID:     sendOut.TurnID,
+			TurnID:     sendOut.TurnId,
 			TurnNumber: sendOut.TurnNumber,
 		}}, nil
 
@@ -218,7 +238,7 @@ func (d *Driver) StartTurn(ctx workflow.Context, input router.Input) (router.Sta
 func sendAgentMessage(ctx workflow.Context, agentClient workflow.NexusClient, sessionID, msgType, payload string) (harnessgen.SendMessageOutput, error) {
 	var sendOut harnessgen.SendMessageOutput
 	err := agentClient.ExecuteOperation(ctx, harnessgen.AgentService.SendAgentMessage,
-		harnessgen.SendAgentMessageInput{SessionID: sessionID, MsgType: msgType, Payload: payload},
+		harnessgen.SendAgentMessageInput{SessionId: sessionID, MsgType: msgType, Payload: payload},
 		workflow.NexusOperationOptions{ScheduleToCloseTimeout: 60 * time.Second},
 	).Get(ctx, &sendOut)
 	return sendOut, err
@@ -231,7 +251,7 @@ func sendAgentMessage(ctx workflow.Context, agentClient workflow.NexusClient, se
 func startSlashTurn(ctx workflow.Context, agentClient workflow.NexusClient, sessionID string, s *router.SlashCommand) (router.StartResult, error) {
 	var ifaceOut harnessgen.QueryOperatorInterfaceOutput
 	if err := agentClient.ExecuteOperation(ctx, harnessgen.AgentService.QueryOperatorInterface,
-		harnessgen.QuerySessionInput{SessionID: sessionID},
+		harnessgen.QuerySessionInput{SessionId: sessionID},
 		workflow.NexusOperationOptions{ScheduleToCloseTimeout: 10 * time.Second},
 	).Get(ctx, &ifaceOut); err != nil {
 		return router.StartResult{Reply: "_No active session. Start a conversation first before using slash commands._"}, nil
@@ -249,7 +269,7 @@ func startSlashTurn(ctx workflow.Context, agentClient workflow.NexusClient, sess
 		// Harness operator command: synchronous, no turn, returns text directly.
 		var opOut harnessgen.ExecuteOperatorCommandOutput
 		if err := agentClient.ExecuteOperation(ctx, harnessgen.AgentService.ExecuteOperatorCommand,
-			harnessgen.ExecuteOperatorCommandInput{SessionID: sessionID, Name: s.Name, Arg: &s.Arg},
+			harnessgen.ExecuteOperatorCommandInput{SessionId: sessionID, Name: s.Name, Arg: &s.Arg},
 			workflow.NexusOperationOptions{ScheduleToCloseTimeout: 30 * time.Second},
 		).Get(ctx, &opOut); err != nil {
 			return router.StartResult{Reply: fmt.Sprintf("_Command failed: %v_", err)}, nil
@@ -265,7 +285,7 @@ func startSlashTurn(ctx workflow.Context, agentClient workflow.NexusClient, sess
 	}
 	return router.StartResult{Handle: &router.TurnHandle{
 		SessionID:  sessionID,
-		TurnID:     sendOut.TurnID,
+		TurnID:     sendOut.TurnId,
 		TurnNumber: sendOut.TurnNumber,
 	}}, nil
 }
@@ -273,7 +293,7 @@ func startSlashTurn(ctx workflow.Context, agentClient workflow.NexusClient, sess
 func resolveApproval(ctx workflow.Context, agentClient workflow.NexusClient, sessionID string, a *router.ApprovalDecision) (router.StartResult, error) {
 	var out harnessgen.ApproveToolCallOutput
 	if err := agentClient.ExecuteOperation(ctx, harnessgen.AgentService.ApproveToolCall,
-		harnessgen.ApproveToolCallInput{SessionID: sessionID, ToolID: a.ToolID, Approved: a.Approved},
+		harnessgen.ApproveToolCallInput{SessionId: sessionID, ToolId: a.ToolID, Approved: a.Approved},
 		workflow.NexusOperationOptions{ScheduleToCloseTimeout: 30 * time.Second},
 	).Get(ctx, &out); err != nil {
 		workflow.GetLogger(ctx).Warn("StartTurn: approveToolCall failed",
@@ -290,7 +310,7 @@ func (d *Driver) PollTurn(ctx workflow.Context, handle router.TurnHandle, cursor
 	var pollOut harnessgen.PollMessagesOutput
 	if err := agentClient.ExecuteOperation(ctx, harnessgen.AgentService.PollMessages,
 		harnessgen.PollMessagesInput{
-			SessionID:      handle.SessionID,
+			SessionId:      handle.SessionID,
 			Cursor:         cursor,
 			TimeoutSeconds: ptr(5.0),
 		},
@@ -313,7 +333,9 @@ func (d *Driver) PollTurn(ctx workflow.Context, handle router.TurnHandle, cursor
 			workflow.GetLogger(ctx).Warn("PollTurn: decodeTurnEvent failed", "error", err)
 			continue
 		}
-		if turnNumber < int(handle.TurnNumber) {
+		// Stream only this handle's turn. Events of a later turn belong to the
+		// router workflow that started that turn.
+		if turnNumber != int(handle.TurnNumber) {
 			continue
 		}
 		if delta := turnEventToDelta(*event); delta != nil {

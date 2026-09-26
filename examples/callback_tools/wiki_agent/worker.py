@@ -26,14 +26,12 @@ import sys
 
 from google.genai import Client as GeminiClient
 from temporalio.client import Client
-from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.envconfig import ClientConfig
 from temporalio.worker import Worker
 
 from temporal_agent_harness.harness.stream_transport import provider_from_env
-
+from temporal_agent_harness.plugin import AgentHarnessPlugin
 from temporal_agent_harness.ai_sdks.google_genai_plugin import GoogleGenAIPlugin
-from temporal_agent_harness.utils.large_payload import with_large_payload_offload
 
 from .workflow import TASK_QUEUE, WikiAgentWorkflow
 
@@ -54,23 +52,22 @@ async def main() -> None:
         sys.exit("error: GEMINI_API_KEY env var not set")
     plugin = GoogleGenAIPlugin(GeminiClient(api_key=api_key))
 
-    # Match the session-manager worker + server converter (large-payload offload) so every
-    # process reads the same payloads.
+    # AgentHarnessPlugin after it: it leaves the Gemini plugin's payload converter in place and
+    # adds the harness's large-payload offload, so this worker, the session-manager worker,
+    # and the web server all read the same payloads.
     connect_config = ClientConfig.load_client_connect_config()
     provider = provider_from_env()
     client = await Client.connect(
-        **connect_config,
-        plugins=[plugin, provider],
-        data_converter=await with_large_payload_offload(pydantic_data_converter),
+        **connect_config, plugins=[plugin, AgentHarnessPlugin(), provider]
     )
 
     worker = Worker(
         client,
         task_queue=task_queue,
         workflows=[WikiAgentWorkflow],
-        # No tool activities: the wiki tools are callback tools fulfilled by the client. The
-        # Gemini interactions activity is registered by the plugin above.
-        activities=[],
+        # No activities to declare: the wiki tools are callback tools fulfilled by the client,
+        # the Gemini interactions activity comes from the Gemini plugin, and the harness's own
+        # activities come from AgentHarnessPlugin.
     )
     print(
         f"Wiki agent worker ready: "

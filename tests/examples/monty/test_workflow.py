@@ -27,7 +27,7 @@ from temporal_agent_harness.harness.agent_protocol import (
     AgentMessageReply,
 )
 
-from temporal_agent_harness.harness.code_mode.activities import CODE_MODE_ACTIVITIES
+from temporal_agent_harness.plugin import AgentHarnessPlugin
 
 from examples.monty import activities
 from examples.monty.workflow import MontyDynamicAgentWorkflow
@@ -39,11 +39,14 @@ async def client_and_queue():
         data_converter=pydantic_data_converter
     )
     task_queue = f"monty-agent-test-{uuid.uuid4()}"
+    # Mirrors examples/monty/worker.py: the harness plugin registers the travel tools' activity
+    # bodies and the Code Mode stepping activities. (Passed to the Worker rather than the
+    # client because the test env's client is already connected.)
     async with Worker(
         env.client,
         task_queue=task_queue,
         workflows=[MontyDynamicAgentWorkflow],
-        activities=[*activities.ALL_ACTIVITIES, *CODE_MODE_ACTIVITIES],
+        plugins=[AgentHarnessPlugin(tools=activities.ALL_TOOLS)],
     ):
         try:
             yield env.client, task_queue
@@ -54,7 +57,7 @@ async def client_and_queue():
 async def _reply_text(client: Client, workflow_id: str) -> str:
     reply: str | None = None
     async for envelope in turn_events(client, workflow_id):
-        if envelope.event.type == AgentEventType.REPLY:
+        if envelope.event.type == AgentEventType.MESSAGE_HANDLER_END:
             # run_script returns a TextReply; read its text off the output dict.
             reply = envelope.event.output.get("text")
         if envelope.event.type == AgentEventType.TURN_END:
@@ -92,7 +95,7 @@ async def test_script_calls_host_functions(client_and_queue):
     )
     await handle.execute_update(
         SEND_AGENT_MESSAGE_UPDATE,
-        AgentMessage(type="run_script", payload={"script": script}, expected_turn=1),
+        AgentMessage(type="run_script", payload={"script": script}),
         result_type=AgentMessageReply,
     )
 
@@ -114,7 +117,7 @@ async def test_script_syntax_error_is_reported(client_and_queue):
     )
     await handle.execute_update(
         SEND_AGENT_MESSAGE_UPDATE,
-        AgentMessage(type="run_script", payload={"script": "def ("}, expected_turn=1),
+        AgentMessage(type="run_script", payload={"script": "def ("}),
         result_type=AgentMessageReply,
     )
 

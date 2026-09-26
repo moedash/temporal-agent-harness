@@ -30,7 +30,8 @@ from temporal_agent_harness.harness.agent_protocol import (
     TURN_EVENTS_TOPIC,
     AgentEvent,
     AgentEventType,
-    AgentReply,
+    AgentStateSnapshot,
+    MessageHandlerEnd,
     SubagentMessageSent,
     SubagentReplyReceived,
     SubagentStarted,
@@ -66,11 +67,11 @@ def _ev(agent_id: str, turn_number: int, payload: Any, *, turn_id: str | None = 
 
 
 def _ts(agent_id: str, turn: int) -> AgentEvent:
-    return _ev(agent_id, turn, TurnStarted(user_message="hi"))
+    return _ev(agent_id, turn, TurnStarted())
 
 
 def _reply(agent_id: str, turn: int) -> AgentEvent:
-    return _ev(agent_id, turn, AgentReply(output={"ok": True}))
+    return _ev(agent_id, turn, MessageHandlerEnd(output={"ok": True}))
 
 
 def _te(agent_id: str, turn: int) -> AgentEvent:
@@ -87,7 +88,7 @@ def _ms(
             subagent_id=child[:6],
             agent_key="k",
             workflow_id=child,
-            function="f",
+            handler="f",
             subagent_turn=child_turn,
             after_cursor=after_cursor,
         ),
@@ -102,7 +103,7 @@ def _rr(agent_id: str, parent_turn: int, *, child: str, child_turn: int, outcome
             subagent_id=child[:6],
             agent_key="k",
             workflow_id=child,
-            function="f",
+            handler="f",
             subagent_turn=child_turn,
             outcome=outcome,  # type: ignore[arg-type]
         ),
@@ -122,6 +123,20 @@ def _stopped(agent_id: str, parent_turn: int, *, child: str) -> AgentEvent:
         agent_id,
         parent_turn,
         SubagentStopped(subagent_id=child[:6], agent_key="k", workflow_id=child),
+    )
+
+
+def _state_snapshot(agent_id: str) -> AgentEvent:
+    """What an agent publishes when it registers observable state in ``@workflow.init``.
+
+    Turn 0, following the operator-command convention: it happened before any turn, so there
+    is no turn for it to belong to.
+    """
+    return _ev(
+        agent_id,
+        0,
+        AgentStateSnapshot(state_id="plan", version=0, value={"steps": []}),
+        turn_id="",
     )
 
 
@@ -349,6 +364,20 @@ def test_close_gate_holds_reply_received_until_child_turn_end_emitted():
     assert gates.ready(is_child=False, source_workflow_id="P", ev=rr)
 
 
+def test_open_gate_does_not_strand_a_child_event_that_belongs_to_no_turn():
+    """A turn-0 child event is ready immediately, because nothing could ever open it.
+
+    No ``subagent_message_sent`` carries ``subagent_turn=0``, so the open gate has no way to
+    let one through — holding it is not a delay, it is forever. And a held event stays the
+    cursor's HEAD, so it takes the child's entire stream down with it: a subagent that
+    registered observable state in ``@workflow.init`` delivered nothing at all.
+    """
+    gates = Gates()
+    assert gates.ready(is_child=True, source_workflow_id="C", ev=_state_snapshot("C"))
+    # The exemption is exactly turn 0 and nothing else: a real turn still waits for its bracket.
+    assert not gates.ready(is_child=True, source_workflow_id="C", ev=_ts("C", 1))
+
+
 def test_root_events_are_never_open_gated():
     gates = Gates()
     # A non-child (root) event is ready regardless of opened-set state.
@@ -399,6 +428,24 @@ async def test_single_subagent_turn_is_nested_in_its_bracket(select):
     assert len(merged) == len(streams["P"]) + len(streams["C"])
 
 
+@pytest.mark.parametrize("select", [select_replay, select_live])
+async def test_child_state_registered_before_any_turn_does_not_wedge_its_stream(select):
+    """The engine-level half of the gate exemption, on the shape that actually shipped it.
+
+    Found by giving the Monty script-runner an observable trip board: registering state in
+    ``@workflow.init`` puts a turn-0 event at offset 0 of the child's stream, and the merged
+    view then lost every event of the child's FIRST turn — the second turn only surfaced
+    because it mounts a fresh cursor past the stranded head, which is what made the symptom
+    read as a turn-counting bug rather than a stuck stream.
+    """
+    streams = _parent_one_child_turn()
+    streams["C"] = [_state_snapshot("C"), *streams["C"]]
+    merged = await _run_merge(streams, root="P", select=select)
+    assert_valid_merge(merged, streams)
+    assert len(merged) == len(streams["P"]) + len(streams["C"])
+    assert any(m.event.type == AgentEventType.STATE_SNAPSHOT for m in merged)
+
+
 async def test_replay_is_deterministic():
     streams = _parent_one_child_turn()
     a = await _run_merge(streams, root="P", select=select_replay)
@@ -412,10 +459,10 @@ async def test_replay_is_deterministic():
         ("C", AgentEventType.TURN_STARTED),
         ("C", AgentEventType.TOOL_START),
         ("C", AgentEventType.TOOL_END),
-        ("C", AgentEventType.REPLY),
+        ("C", AgentEventType.MESSAGE_HANDLER_END),
         ("C", AgentEventType.TURN_END),
         ("P", AgentEventType.SUBAGENT_REPLY_RECEIVED),
-        ("P", AgentEventType.REPLY),
+        ("P", AgentEventType.MESSAGE_HANDLER_END),
         ("P", AgentEventType.TURN_END),
     ]
 
@@ -494,15 +541,15 @@ async def test_nested_grandchild_recursion(select):
 
 async def test_send_message_skip_preamble_starts_at_target_turn_started():
     # A resume mid-session: the root stream has a prior turn (turn 1) we must NOT emit, then our
-    # target turn 2. We start at accepted_offset and skip until turn 2's turn_started.
+    # target turn 2. We start at the position read before the send and skip until turn 2's turn_started.
     target = "P-t2"
     streams = {
         "P": [
             _ts("P", 1),  # offset 0 — prior turn, must be skipped
             _reply("P", 1),  # offset 1 — skipped
             _te("P", 1),  # offset 2 — skipped
-            _ev("P", 2, TurnStarted(user_message="go"), turn_id=target),  # offset 3
-            _ev("P", 2, AgentReply(output={}), turn_id=target),
+            _ev("P", 2, TurnStarted(), turn_id=target),  # offset 3
+            _ev("P", 2, MessageHandlerEnd(output={}), turn_id=target),
             _ev("P", 2, TurnEnded(), turn_id=target),
         ],
     }
@@ -525,7 +572,7 @@ async def test_send_message_skip_preamble_starts_at_target_turn_started():
     # Only the target turn's events, starting at its turn_started.
     assert [m.event.type for m in merged] == [
         AgentEventType.TURN_STARTED,
-        AgentEventType.REPLY,
+        AgentEventType.MESSAGE_HANDLER_END,
         AgentEventType.TURN_END,
     ]
     assert all(m.turn_id == target for m in merged)
@@ -533,7 +580,7 @@ async def test_send_message_skip_preamble_starts_at_target_turn_started():
 
 async def test_send_message_resume_mounts_reused_child_after_cursor():
     # Resume on parent turn 2, which drives child C's turn 2. C's turns 1 (from an earlier, skipped
-    # parent turn) must NOT appear — the merge mounts C at the from_offset carried on message_sent,
+    # parent turn) must NOT appear — the merge mounts C after the after_cursor carried on message_sent,
     # skipping C's pre-resume history (whose own message_sent isn't on this merged stream).
     target = "P-t2"
     streams = {
@@ -542,7 +589,7 @@ async def test_send_message_resume_mounts_reused_child_after_cursor():
             _ms("P", 1, child="C", child_turn=1, after_cursor=""),
             _rr("P", 1, child="C", child_turn=1),
             _te("P", 1),
-            _ev("P", 2, TurnStarted(user_message="go"), turn_id=target),
+            _ev("P", 2, TurnStarted(), turn_id=target),
             # C turn 2 begins at child offset 3.
             _ms("P", 2, child="C", child_turn=2, after_cursor="2"),
             _rr("P", 2, child="C", child_turn=2),
@@ -678,7 +725,7 @@ async def test_unreadable_child_does_not_crash_the_merge():
         AgentEventType.TURN_STARTED,
         AgentEventType.SUBAGENT_MESSAGE_SENT,
         AgentEventType.SUBAGENT_REPLY_RECEIVED,
-        AgentEventType.REPLY,
+        AgentEventType.MESSAGE_HANDLER_END,
         AgentEventType.TURN_END,
     ]
     # No actual child turn DETAIL leaked (no C turn_started/reply/turn_end)...
@@ -722,7 +769,7 @@ async def test_dead_child_releases_close_gate_and_parent_completes(select):
         AgentEventType.SUBAGENT_STARTED,
         AgentEventType.SUBAGENT_MESSAGE_SENT,
         AgentEventType.SUBAGENT_REPLY_RECEIVED,
-        AgentEventType.REPLY,
+        AgentEventType.MESSAGE_HANDLER_END,
         AgentEventType.TURN_END,
     ]
     markers = [m for m in merged if m.event.type == AgentEventType.SUBAGENT_STREAM_UNAVAILABLE]
@@ -800,7 +847,7 @@ async def test_child_that_ends_without_turn_end_releases_gate():
     # C's available detail (turn_started, reply) still came through before it ran out.
     assert [m.event.type for m in merged if m.agent_id == "C" and m.event.type != AgentEventType.SUBAGENT_STREAM_UNAVAILABLE] == [
         AgentEventType.TURN_STARTED,
-        AgentEventType.REPLY,
+        AgentEventType.MESSAGE_HANDLER_END,
     ]
     assert sum(m.event.type == AgentEventType.SUBAGENT_STREAM_UNAVAILABLE for m in merged) == 1
 
@@ -878,7 +925,7 @@ def test_malformed_resume_point_is_rejected(text):
         ResumePoint.decode(text)
 
 
-async def test_resume_from_offset_streams_only_events_after_it():
+async def test_resume_after_a_cursor_streams_only_events_after_it():
     # Resuming from offset 3 (start of turn 2) yields turns 2 and 3 — turn 1 is not re-sent. No
     # skip: the root simply starts at offset 3, which is turn 2's turn_started.
     streams = _three_turn_root()
@@ -897,8 +944,8 @@ async def test_resume_mid_turn_streams_the_rest_of_that_turn_no_fast_forward():
         streams, root="P", select=select_replay, root_after_cursor="3"
     )
     assert [e.event.type for e in merged] == [
-        AgentEventType.REPLY, AgentEventType.TURN_END,        # rest of turn 2 (from offset 4)
-        AgentEventType.TURN_STARTED, AgentEventType.REPLY, AgentEventType.TURN_END,  # turn 3
+        AgentEventType.MESSAGE_HANDLER_END, AgentEventType.TURN_END,        # rest of turn 2 (after cursor 3)
+        AgentEventType.TURN_STARTED, AgentEventType.MESSAGE_HANDLER_END, AgentEventType.TURN_END,  # turn 3
     ]
     assert [e.turn_number for e in merged] == [2, 2, 3, 3, 3]
 
@@ -906,7 +953,7 @@ async def test_resume_mid_turn_streams_the_rest_of_that_turn_no_fast_forward():
 @pytest.mark.parametrize("select", [select_replay, select_live])
 async def test_resume_includes_subagent_dispatched_at_or_after_offset(select):
     # Resume at the start of parent turn 2 (offset 4), which drives subagent C (turn 2). C's turn-2
-    # message_sent is at/after the offset, so C mounts at its from_offset (3) and turn-2 detail
+    # message_sent is at/after the offset, so C mounts after its after_cursor and turn-2 detail
     # merges normally; C's turn-1 detail (dispatched before the offset) is not re-sent.
     streams = {
         "P": [
@@ -955,7 +1002,7 @@ async def test_resume_inside_subagent_turn_omits_that_subagent_but_parent_flows(
     assert [e.event.type for e in merged if e.agent_id == "P"] == [
         AgentEventType.TOOL_START,
         AgentEventType.SUBAGENT_REPLY_RECEIVED,
-        AgentEventType.REPLY,
+        AgentEventType.MESSAGE_HANDLER_END,
         AgentEventType.TURN_END,
     ]
     assert not [m for m in merged if m.agent_id == "C"]
@@ -1017,7 +1064,7 @@ async def test_a_child_whose_cursor_the_provider_refuses_drops_only_that_child()
         AgentEventType.TURN_STARTED,
         AgentEventType.SUBAGENT_MESSAGE_SENT,
         AgentEventType.SUBAGENT_REPLY_RECEIVED,
-        AgentEventType.REPLY,
+        AgentEventType.MESSAGE_HANDLER_END,
         AgentEventType.TURN_END,
     ]
     # The refused child lands on the same marker an unreadable one does.

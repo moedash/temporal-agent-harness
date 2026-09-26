@@ -98,8 +98,7 @@ prose: what you changed, which files, and how you checked it. Never invent file 
 command output you didn't actually read."""
 
 
-@workflow.defn(name="CodingAgent")
-@agent.defn
+@agent.defn(name="CodingAgent")
 class CodingAgentWorkflow:
     @workflow.init
     def __init__(self, config: AgentConfig) -> None:

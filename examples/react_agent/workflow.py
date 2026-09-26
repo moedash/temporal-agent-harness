@@ -52,7 +52,7 @@ with workflow.unsafe.imports_passed_through():
 
 
 TASK_QUEUE = "react-agent"
-DEFAULT_MODEL = "gpt-5.1"
+DEFAULT_MODEL = "gpt-5.6-luna"
 MCP_SERVER_NAME = "f1-data"
 
 # Streaming vs non-streaming is chosen here, at the SDK call site (see `ask`). Toggle it with the
@@ -83,8 +83,7 @@ answer to continue. Prefer asking over guessing when it matters. If the user's a
 call `ask_user` again."""
 
 
-@workflow.defn(name="ReactAgent")
-@agent.defn
+@agent.defn(name="ReactAgent")
 class ReactAgentWorkflow:
     """A ReAct agent (weather/geo/IP tools + F1 MCP) driven by the OpenAI Agents SDK."""
 
@@ -122,7 +121,11 @@ class ReactAgentWorkflow:
             # caching each step re-runs the MCP `list_tools` activity. The F1 tool set is static, so
             # cache it — one `list_tools` per turn instead of one per model step. (The reference is
             # rebuilt each turn, so the cache is per-turn, not per-session.)
-            mcp_servers=[stateless_mcp_server(MCP_SERVER_NAME, cache_tools_list=True)],
+            mcp_servers=[
+                stateless_mcp_server(
+                    MCP_SERVER_NAME, cache_tools_list=True, runner=self._runner
+                )
+            ],
         )
         input_items: list[TResponseInputItem] = [
             *self._conversation,

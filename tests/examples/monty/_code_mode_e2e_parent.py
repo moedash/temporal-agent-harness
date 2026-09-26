@@ -98,8 +98,7 @@ class RunCode(BaseModel):
     script: str = Field(description="The Python script to execute in the sandbox.")
 
 
-@workflow.defn(name="CodeModeE2EParent")
-@agent.defn
+@agent.defn(name="CodeModeE2EParent")
 class CodeModeE2EParentWorkflow:
     @workflow.init
     def __init__(self, config: AgentConfig) -> None:

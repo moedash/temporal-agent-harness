@@ -39,12 +39,12 @@ harness needs. The harness only supplies a thin glue module.
 | File | Role |
 |---|---|
 | `workflow.py` | `PydanticAIHelloAgent` — the harness agent; one `ask` handler, one `get_weather` tool, driven by `TemporalAgent.run` + the harness event-stream handler. |
-| `worker.py` | Worker hosting the workflow; `PydanticAIPlugin` on the client, `AgentPlugin(agent)` on the worker. |
+| `worker.py` | Worker hosting the workflow; `PydanticAIPlugin` + `AgentHarnessPlugin` on the client, `AgentPlugin(agent)` on the worker. |
 | `agents.toml` | Registry entry that makes this agent selectable in the shared web UI. |
 
 There is **no per-example client**: like the other examples, this agent is driven by the shared
 example stack — the packaged `SessionManagerWorkflow` worker plus the FastAPI app and web UI
-(`examples/app.py`). Registering the agent in `agents.toml` is all it takes to make it driveable.
+(`temporal-agent-harness serve`). Registering the agent in `agents.toml` is all it takes to make it driveable.
 
 ## Run it
 
@@ -69,7 +69,7 @@ event produced by the handler translating a raw Pydantic AI event in the model a
 Without `just`, the equivalent commands (from the repo root):
 
 ```sh
-uv run --group examples python -m examples.session_manager_worker
-uv run --group examples python -m examples.app examples/pydantic_ai_hello/agents.toml --host 0.0.0.0 --port 8000
+uv run --group examples temporal-agent-harness session-manager
+uv run --group examples temporal-agent-harness serve examples/pydantic_ai_hello/agents.toml --host 0.0.0.0 --port 8000
 uv run --group examples python -m examples.pydantic_ai_hello.worker
 ```

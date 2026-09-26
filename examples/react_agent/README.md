@@ -40,9 +40,12 @@ Ask it a question and it chains tools to find the answer:
   with `StatelessMCPServerProvider` and referenced in the workflow with
   `stateless_mcp_server("f1-data")`. Each MCP `list_tools` / `call_tool` runs as a Temporal
   activity — durable, retryable, and visible in the Temporal Web UI.
-  - **Caveat — MCP tools bypass the harness.** MCP calls do **not** go through `run_tool`, so they
-    do not appear as harness tool cards on the turn stream and are **not** approval-gateable. The
-    harness-wrapped weather tools still show full lifecycle. This illustrates the harness boundary.
+  - **MCP tools are under harness governance too.** Pass `runner=self._runner` to the
+    factory. The SDK calls `MCPServer.call_tool` directly rather than the harness's
+    `run_tool`, so the factory wraps the server with the runner it needs. Each MCP call is
+    then approval-gateable and publishes `tool_start` / `tool_end` / `tool_error` under the
+    same `tool_id` as its `tool_requested`, so its turn-stream card resolves like any other
+    tool's.
 - **Streaming is a toggle.** By default (`REACT_AGENT_STREAM` unset/`1`) the turn runs
   `Runner.run_streamed(...)`, so model calls route through the streaming activity and the harness
   observer translates raw OpenAI events into the live turn stream (`model_interaction_started` →
@@ -68,14 +71,14 @@ Ask it a question and it chains tools to find the answer:
 | File | Role |
 |---|---|
 | `workflow.py` | `ReactAgent` — the harness agent; one `ask` handler, local tools + `ask_user` adapted onto the SDK plus the F1 MCP server, driven by `Runner.run_streamed`. |
-| `tool_activities.py` | The four location/weather tools as `@agent.activity_tool_defn` activities (httpx), plus `ALL_TOOLS` / `ALL_ACTIVITIES`. |
+| `tool_activities.py` | The four location/weather tools as `@agent.activity_tool_defn` activities (httpx), plus `ALL_TOOLS` — the list the worker hands to `AgentHarnessPlugin(tools=...)`. |
 | `human_tools.py` | The `ask_user` human-in-the-loop **callback tool** (`@agent.callback_tool_defn`), plus `HUMAN_TOOLS`. No activity body — fulfilled by a client. |
-| `worker.py` | Worker hosting the workflow + the four tool activities; registers the F1 MCP provider and wires the plugin for the harness streaming seam. |
+| `worker.py` | Worker hosting the workflow. Declares no activities: `AgentHarnessPlugin(tools=...)` registers the four tool bodies (skipping the bodiless `ask_user`) and the OpenAI plugin registers the model activities. Also registers the F1 MCP provider and wires the harness streaming seam. |
 | `client.py` | A terminal client: a session picker that shows which sessions are **waiting on an `ask_user`**, then lets you answer open questions, chat, or create a session — all over HTTP. |
 | `agents.toml` | Registry entry that makes this agent selectable in the shared web UI. |
 
 The agent is driven by the shared example stack — the packaged `SessionManagerWorkflow` worker plus
-the FastAPI app and web UI (`examples/app.py`); registering it in `agents.toml` is all that takes.
+the FastAPI app and web UI (`temporal-agent-harness serve`); registering it in `agents.toml` is all that takes.
 Unlike the simpler examples, it **also ships a terminal `client.py`** — needed to answer `ask_user`,
 since the packaged web UI has no affordance for fulfilling a callback tool.
 
@@ -149,15 +152,15 @@ marks which are waiting on an `ask_user` (⏳). From it you can:
   submitted; the client then shows the agent's continued reply.
 - **`--session <id>`** opens a session directly, surfacing any already-pending question.
 
-Inside a session, client-local navigation is keyed off `:` (not `/`, which is reserved for the
-harness's own slash commands): `:questions` re-checks for open questions, `:sessions` returns to the
-picker, and `:quit` exits.
+Inside a session, client-local navigation is keyed off `:` so it never collides with message
+text: `:questions` re-checks for open questions, `:sessions` returns to the picker, and `:quit`
+exits.
 
 Without `just`, the equivalent commands (from the repo root):
 
 ```sh
-uv run --group examples python -m examples.session_manager_worker
-uv run --group examples python -m examples.app examples/react_agent/agents.toml --host 0.0.0.0 --port 8000
+uv run --group examples temporal-agent-harness session-manager
+uv run --group examples temporal-agent-harness serve examples/react_agent/agents.toml --host 0.0.0.0 --port 8000
 uv run --group examples python -m examples.react_agent.worker
 uv run --group examples python -m examples.react_agent.client
 ```

@@ -9,9 +9,9 @@ durable, approval-gated activity, and the script can combine many with real cont
 ``asyncio.gather`` concurrency).
 
 The conversational front end is a Gemini Interactions tool-calling loop exposing that one Code
-Mode tool. It uses only a custom *function* tool, which chains cleanly across turns via 
-``previous_interaction_id`` — so multi-turn conversation works. The Code Mode tool advertises the 
-exact host-function signatures + result shapes in its own (generated) description, so the system 
+Mode tool. It uses only a custom *function* tool, which chains cleanly across turns via
+``previous_interaction_id`` — so multi-turn conversation works. The Code Mode tool advertises the
+exact host-function signatures + result shapes in its own (generated) description, so the system
 prompt only needs to set the persona and point the model at the tool.
 """
 
@@ -21,8 +21,9 @@ import asyncio
 import json
 from datetime import timedelta
 from functools import partial
-from typing import Sequence
+from typing import Literal, Sequence
 
+from pydantic import BaseModel
 from temporalio import workflow
 from temporalio.exceptions import ApplicationError
 from temporalio.workflow import ActivityConfig
@@ -46,31 +47,42 @@ with workflow.unsafe.imports_passed_through():
         DeltaText,
     )
     from google.genai.client import AsyncClient
-    from temporal_agent_harness.ai_sdks.google_genai_plugin import function_param, google_genai_client
-    from temporal_agent_harness.harness import agent, slash_commands
+    from temporal_agent_harness.ai_sdks.google_genai_plugin import (
+        function_param,
+        google_genai_client,
+    )
+    from temporal_agent_harness.harness import agent
     from temporal_agent_harness.harness.agent_protocol import (
         AgentConfig,
-        SlashCommand,
+        MidTurn,
         TextMessage,
         TextReply,
         ToolApprovalPolicy,
     )
     from temporal_agent_harness.harness.agent_workflow import AgentWorkflowRunner
 
-    from . import activities
+    from . import activities, trip_board
 
 
 TASK_QUEUE = "monty-dynamic-agent"
-SUPPORTED_MODELS = ("gemini-3.5-flash", "gemini-3.1-flash-lite")
+SUPPORTED_MODELS = ("gemini-3.8-flash", "gemini-3.1-flash-lite")
 DEFAULT_MODEL = SUPPORTED_MODELS[0]
 
 
-def model_slash_command(set_model) -> slash_commands.SlashCommandDefinition:
-    return slash_commands.model_selector(
-        choices=SUPPORTED_MODELS,
-        set_model=set_model,
-        description="Set the model for this Monty session.",
-    )
+class SetModel(BaseModel):
+    """Which model this Monty session should use for subsequent turns."""
+
+    # A Literal (not a bare str) so the choice is enforced rather than merely suggested:
+    # pydantic rejects anything else at the update boundary, and the same constraint shows up
+    # as an enum in this handler's `parameters` JSON schema — which is what lets a generic
+    # client render a dropdown without knowing anything about Monty.
+    model: Literal[SUPPORTED_MODELS]  # type: ignore[valid-type]
+
+
+class PolicyUpdate(BaseModel):
+    """Selected tool approval policy name."""
+
+    new_policy: Literal["allow_safe", "strict", "dangerously_skip_all"]
 
 
 SYSTEM_INSTRUCTION = """\
@@ -90,25 +102,44 @@ book, or summarize) so you can react to results.
 - After a tool result, read it and reply to the user in plain, friendly prose — summarize \
 options, prices, confirmations. You may run more scripts in follow-up turns as the \
 conversation continues.
-- Never invent flight/hotel ids or confirmation codes — only use ones returned by a script."""
+- Never invent flight/hotel ids or confirmation codes — only use ones returned by a script.
+
+Keep the trip board current. The same script can call the board host functions — \
+`open_trip`, `record_booking`, `complete_trip_tasks`, `add_trip_tasks`, `set_trip_status`, \
+`read_trip_board` — and they are how the user watches you work. The board is not a summary you \
+write at the end; it is the running state of the trip, so:
+- `open_trip` as soon as you know which trip this is, BEFORE you search anything. Keep the \
+`trip_id` it returns and use it for every later call (or pass "latest").
+- In the SAME script that books something, `record_booking` it with the confirmation code the \
+booking returned, and name the checklist items it finishes in `completes`. Never let the board \
+show a booked flight next to an outstanding "book the flight".
+- `complete_trip_tasks` as soon as a task is genuinely done, and `add_trip_tasks` the moment you \
+find the trip needs something the plan did not have.
+- `set_trip_status` to "booked" once nothing is left, or "cancelled" if the user calls it off.
+- `read_trip_board` at the start of a follow-up request to recall where you left off.
+Board calls are cheap and are not gated on the user's approval — there is nothing to approve \
+about your own notes — so there is never a reason to batch them up or skip them."""
 
 
-@workflow.defn(name="MontyChatAgent")
-@agent.defn
+@agent.defn(name="MontyChatAgent")
 class MontyChatAgentWorkflow:
+    trip_board = agent.state(trip_board.TripBoard)
+
     @workflow.init
     def __init__(self, config: AgentConfig) -> None:
         self._runner = AgentWorkflowRunner(
             config,
-            # Demo stance: require human approval for EVERY tool call — both the
-            # `run_travel_code` tool and each host call the script makes (search/book flights &
-            # hotels), since every call is dispatched through run_tool and gated.
-            # always_require_approvals does not auto-approve even inherently_safe tools.
-            approval_policy_default=ToolApprovalPolicy.always_require_approvals(),
-            slash_commands=[
-                *slash_commands.default_commands(),
-                model_slash_command(self._set_model),
-            ],
+            # Demo stance: require human approval for EVERY tool call that reaches the outside
+            # world — both the `run_travel_code` tool and each travel host call the script makes
+            # (search/book flights & hotels), since every call is dispatched through run_tool and
+            # gated. The trip-board tools are allowed by name, and only those: they write to the
+            # agent's own notes, so there is nothing for a human to approve, and gating them
+            # would mean a click between every step and the board that is supposed to be showing
+            # the steps. Named rather than `allow_inherently_safe()`, which would also stop
+            # gating the run-code tool itself and take the script review off the table.
+            approval_policy_default=ToolApprovalPolicy.allow_tools(
+                trip_board.BOARD_TOOL_NAMES
+            ),
         )
         self._model: str = DEFAULT_MODEL
         # Server-side conversation chaining id (Interactions API); updated each turn. Safe to
@@ -118,14 +149,14 @@ class MontyChatAgentWorkflow:
         # Python script that calls the travel operations as async host functions; each host call
         # runs as a durable, approval-gated activity via run_tool.
         self._code_tool = agent.code_mode_tool(
-            [
-                activities.search_flights_activity,
-                activities.search_hotels_activity,
-                activities.book_flight_activity,
-                activities.book_hotel_activity,
-                activities.get_trip_summary_activity,
-            ],
+            # The travel tools plus the board tools, in one sandbox: a script can book a
+            # flight and record it on the board without a round trip through the model, so
+            # the board cannot drift from what was actually booked.
+            [*activities.ALL_TOOLS, *trip_board.BOARD_TOOLS],
             name="run_travel_code",
+            # Hidden from the model and from the generated stubs: the script names the
+            # trip, never the state it lives in.
+            injections={"board": self.trip_board},
         )
 
     @workflow.run
@@ -140,7 +171,7 @@ class MontyChatAgentWorkflow:
         )
         await self._runner.run(self)
 
-    @agent.accepts
+    @agent.accepts(mid_turn=MidTurn.ENQUEUE)
     async def ask(self, message: TextMessage) -> TextReply:
         """Chat with the travel assistant. Describe the trip you want (flights, hotels,
         dates, traveler name) in plain text; the assistant converses, writes and runs Python
@@ -148,18 +179,32 @@ class MontyChatAgentWorkflow:
         reply_text = await self._handle_chat_turn(self._gemini, message.text)
         return TextReply(text=reply_text)
 
-    @agent.accepts
-    async def slash(self, command: SlashCommand) -> TextReply:
-        """Apply a slash command to this parent agent session."""
-        return TextReply(
-            text=(
-                f"Unknown Monty slash command: `{command.name}`. Try `/model`. "
-                "Harness commands include `/approvals`, `/allow-tools`, and `/status`."
-            )
-        )
+    # ACCEPT: reconfiguring the session is not work, so it should not wait behind work. It
+    # joins the open turn and applies immediately, which is the whole point of being able to
+    # switch models while the agent is mid-conversation. model_callable=False keeps it off a
+    # parent agent's generated toolset by default — choosing the model is an operator's call,
+    # not something a driving model should do to its own child.
+    @agent.accepts(mid_turn=MidTurn.ACCEPT, model_callable=False)
+    async def set_model(self, message: SetModel) -> TextReply:
+        """Set the model this session uses for subsequent turns. Takes effect on the next
+        model call, so a turn already in flight finishes on the model it started with."""
+        self._model = message.model
+        return TextReply(text=f"Model set to **{message.model}**.")
 
-    def _set_model(self, model: str) -> None:
-        self._model = model
+    @agent.accepts(mid_turn=MidTurn.ACCEPT, model_callable=False)
+    async def set_approval_policy(self, policy_update: PolicyUpdate) -> TextReply:
+        """Update the agent's tool approval policy."""
+        match policy_update.new_policy:
+            case "allow_safe":
+                updated_policy = ToolApprovalPolicy.allow_inherently_safe()
+            case "strict":
+                updated_policy = ToolApprovalPolicy.always_require_human_approval()
+            case "dangerously_skip_all":
+                updated_policy = ToolApprovalPolicy.dangerously_skip_all()
+            case _:
+                return TextReply(text=f"Unknown approval policy requested: {policy_update}")
+        self._runner.set_approval_policy(updated_policy)
+        return TextReply(text=f"Updated tool approval policy to: {policy_update}")
 
     # ------------------------------------------------------------------ chat loop
 
@@ -188,9 +233,7 @@ class MontyChatAgentWorkflow:
             if not pending_calls:
                 return reply_text
 
-            next_input = await asyncio.gather(
-                *(self._run_one_tool(fc) for fc in pending_calls)
-            )
+            next_input = await asyncio.gather(*(self._run_one_tool(fc) for fc in pending_calls))
 
     async def _run_one_tool(self, call: FunctionCallStep) -> FunctionResultStepParam:
         """Execute one ``run_travel_code`` call via ``run_tool`` and return its result.
@@ -200,9 +243,7 @@ class MontyChatAgentWorkflow:
         try:
             if call.name != self._code_tool.__name__:
                 raise ValueError(f"unknown tool: {call.name!r}")
-            result = await self._runner.run_tool(
-                call.id, self._code_tool, **call.arguments
-            )
+            result = await self._runner.run_tool(call.id, self._code_tool, **call.arguments)
             response: FunctionResultStepParam = {
                 "type": "function_result",
                 "call_id": call.id,
@@ -251,9 +292,7 @@ class MontyChatAgentWorkflow:
             stream=True,
         )
         if previous_interaction_id:
-            stream = await interactions_create_fn(
-                previous_interaction_id=previous_interaction_id
-            )
+            stream = await interactions_create_fn(previous_interaction_id=previous_interaction_id)
         else:
             stream = await interactions_create_fn()
 
@@ -264,16 +303,12 @@ class MontyChatAgentWorkflow:
         async for event in stream:
             match event:
                 case ErrorEvent(error=Error(message=msg, code=code)):
-                    raise ApplicationError(
-                        msg or "stream error", type=code or "stream_error"
-                    )
+                    raise ApplicationError(msg or "stream error", type=code or "stream_error")
                 case ErrorEvent():
                     raise ApplicationError("unknown stream error", type="stream_error")
                 case StepStart(index=idx, step=FunctionCallStep() as call):
                     calls_by_index[idx] = call
-                case StepDelta(
-                    index=idx, delta=DeltaArgumentsDelta(arguments=args)
-                ) if args:
+                case StepDelta(index=idx, delta=DeltaArgumentsDelta(arguments=args)) if args:
                     arg_buffers[idx] = arg_buffers.get(idx, "") + args
                 case StepDelta(delta=DeltaText(text=text)) if text:
                     text_parts.append(text)
@@ -287,9 +322,7 @@ class MontyChatAgentWorkflow:
             )
 
         function_calls = [
-            calls_by_index[idx].model_copy(
-                update={"arguments": json.loads(arg_buffers[idx])}
-            )
+            calls_by_index[idx].model_copy(update={"arguments": json.loads(arg_buffers[idx])})
             if arg_buffers.get(idx)
             else calls_by_index[idx]
             for idx in sorted(calls_by_index)

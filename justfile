@@ -8,11 +8,12 @@
 # F1_MCP_SERVER_HOME, ...). Prerequisites + run order: see the "Run everything" section in README.md.
 # Build/package + Nexus/Slack/Teams connector recipes follow the run recipes.
 
+# Shows a notice when running from an untagged commit (silent on a release archive).
+import 'scripts/untagged-notice.just'
+
 ui := justfile_directory() / "ui"
 monty := justfile_directory() / "examples" / "monty"
 nexus_dir := justfile_directory() / "nexus"
-devserver_dir := nexus_dir / "devserver"
-build_dir := justfile_directory() / ".build"
 
 # List available recipes.
 default:
@@ -22,47 +23,52 @@ default:
 app-install:
     pnpm --dir "{{ui}}" install
 
-# Type-check the Svelte UI and run the local Svelte 5 syntax guard.
+# Type-check the Svelte UI and run its test suite.
 app-check:
     pnpm --dir "{{ui}}" run check
-    pnpm --dir "{{ui}}" run check:svelte5
 
 # Build the Svelte UI into temporal_agent_harness/ui/dist.
 app-build:
     pnpm --dir "{{ui}}" run build
 
 # Build, test, and create the wheel/sdist in dist/.
+# Clears dist/ first: `uv build` only ADDS to it, so artifacts from a previously released
+# version linger there indefinitely. That matters at publish time — `uv publish` uploads
+# dist/* by default, so a stale wheel would be pushed to PyPI alongside the current one.
 package: app-build app-check
     uv run pytest
+    rm -rf "{{justfile_directory()}}/dist"
     uv build
 
-# Start the custom Temporal server with Nexus callback/update dynamic config enabled.
-temporal-latest:
+# Minimum `temporal` CLI for the Nexus recipes. Older builds reject the dynamic config
+# keys below, so fail here rather than at the first Nexus call.
+temporal_cli_min := "1.9.1"
+
+# Fail if the `temporal` CLI is missing or older than temporal_cli_min.
+_require-temporal-cli:
     #!/usr/bin/env bash
-    set -euo pipefail
+    set -eu
+    have=$(temporal --version 2>/dev/null | awk '{print $3}')
+    if [ -z "${have}" ]; then
+        echo "error: no 'temporal' CLI on PATH. Nexus needs >= {{temporal_cli_min}}: https://docs.temporal.io/cli" >&2
+        exit 1
+    fi
+    if [ "$(printf '%s\n%s\n' "{{temporal_cli_min}}" "${have}" | sort -V | head -1)" != "{{temporal_cli_min}}" ]; then
+        echo "error: temporal CLI ${have} is too old. Nexus needs >= {{temporal_cli_min}}." >&2
+        exit 1
+    fi
 
-    temporal_build_dir="{{build_dir}}/temporal-src"
-    rm -rf "${temporal_build_dir}"
-    mkdir -p "${temporal_build_dir}"
-
-    echo "Cloning temporalio/temporal@main..."
-    git clone --depth=1 https://github.com/temporalio/temporal.git "${temporal_build_dir}"
-
-    echo "Building temporal-server binary..."
-    cd "${temporal_build_dir}"
-    GOWORK=off GOFLAGS= go build -o "{{devserver_dir}}/temporal-server" ./cmd/server
-
-    rm -rf "${temporal_build_dir}"
-    echo "Built: {{devserver_dir}}/temporal-server"
-
-    cd "{{devserver_dir}}"
-    ./temporal-server --config-file config.yaml --allow-no-auth start
-
-# Start Temporal UI on http://localhost:8233 and point it at the custom server.
-temporal-latest-ui:
-    docker run --rm -p 8233:8080 \
-        -e TEMPORAL_ADDRESS=host.docker.internal:7233 \
-        temporalio/ui
+# Start a local Temporal dev server with the dynamic config Nexus needs (callbacks,
+# update-with-callback, standalone Nexus operations/activities). Web UI: http://localhost:8233.
+# A stock `temporal` CLI release is enough — no custom server build.
+temporal-nexus: _require-temporal-cli
+    temporal server start-dev \
+        --dynamic-config-value 'system.maxCallbacksPerWorkflow=500' \
+        --dynamic-config-value 'component.nexusoperations.callback.endpoint.template="http://localhost:7243/namespaces/{{{{.NamespaceName}}/nexus/callback"' \
+        --dynamic-config-value 'callback.allowedAddresses=[{"Pattern":"*","AllowInsecure":true}]' \
+        --dynamic-config-value 'history.enableUpdateCallbacks=true' \
+        --dynamic-config-value 'nexusoperation.enableStandalone=true' \
+        --dynamic-config-value 'activity.enableStandalone=true'
 
 # Create/update the namespaces and Nexus endpoint needed by the chat connector.
 setup-nexus:
@@ -161,29 +167,38 @@ teams-webhook:
 temporal:
     temporal server start-dev
 
-# Run the shared, agent-agnostic session-manager worker (hosts only SessionManagerWorkflow).
+# Run the packaged, agent-agnostic session-manager worker (hosts only SessionManagerWorkflow).
 session-manager:
     #!/usr/bin/env bash
     set -euo pipefail
     cd "{{justfile_directory()}}"
     set -a; [ -f .env.local ] && . ./.env.local; set +a
-    uv run --group examples python -m examples.session_manager_worker
+    uv run --group examples temporal-agent-harness session-manager
 
-# Build the UI, then serve EVERY example's agents.toml merged on http://localhost:8000, so the UI
-# lists all agents. (An agent only runs if its worker is up — see the worker recipes below.)
-server: app-build
+# Serves the COMMITTED UI build in temporal_agent_harness/ui/dist, so this needs no Node/pnpm —
+# a downloaded release archive runs as-is. If you changed anything under ui/, rebuild it first
+# with `just app-build`, or use `just dev-server` (build + serve). An agent only runs if its
+# worker is up — see the worker recipes below.
+#
+# Serve EVERY example's agents.toml merged on http://localhost:8000, so the UI lists all agents.
+server:
     #!/usr/bin/env bash
     set -euo pipefail
     cd "{{justfile_directory()}}"
     set -a; [ -f .env.local ] && . ./.env.local; set +a
-    uv run --group examples python -m examples.app \
+    uv run --group examples temporal-agent-harness serve \
         examples/openai_hello/agents.toml \
         examples/pydantic_ai_hello/agents.toml \
         examples/react_agent/agents.toml \
         examples/monty/agents.toml \
+        examples/tictactoe/agents.toml \
+        examples/auto_mode/agents.toml \
         examples/callback_tools/wiki_agent/agents.toml \
         examples/callback_tools/coding_agent/agents.toml \
         --host 0.0.0.0 --port 8000
+
+# Rebuild the Svelte UI, then serve — the contributor loop after editing ui/ (needs pnpm).
+dev-server: app-build server
 
 # Run the Svelte Vite dev server with /api proxied to the server on :8000.
 ui-dev:
@@ -202,13 +217,19 @@ worker-react:
 worker-monty:
     cd "{{monty}}" && just worker
 
+worker-tictactoe:
+    cd "{{justfile_directory()}}/examples/tictactoe" && just worker
+
+worker-auto-mode:
+    cd "{{justfile_directory()}}/examples/auto_mode" && just worker
+
 worker-wiki:
     cd "{{justfile_directory()}}/examples/callback_tools/wiki_agent" && just worker
 
 worker-coding:
     cd "{{justfile_directory()}}/examples/callback_tools/coding_agent" && just worker
 
-# Co-launch all six agent workers in one terminal (Ctrl-C stops them all; logs interleave).
+# Co-launch all eight agent workers in one terminal (Ctrl-C stops them all; logs interleave).
 # Requires every agent's prerequisites at once (both API keys, the F1 MCP server, etc.).
 workers:
     #!/usr/bin/env bash
@@ -222,6 +243,8 @@ workers:
     just worker-pydantic &
     just worker-react &
     just worker-monty &
+    just worker-tictactoe &
+    just worker-auto-mode &
     just worker-wiki &
     just worker-coding &
     wait
@@ -278,3 +301,8 @@ install-nexgen:
 nexus-agent-generate: install-nexgen
     "$HOME/.local/bin/nexgen" python temporal_agent_harness/nexus_agent_adapter/agent.nexusrpc.yaml \
         --output temporal_agent_harness/nexus_agent_adapter/generated
+
+# Gets the contract from local and regenerates the Durable Tools Gateway's Python bindings.
+generate-registry-contract: install-nexgen
+    "$HOME/.local/bin/nexgen" python nexus/mcp/nexus_mcp/durable_tools_gateway/registry.nexusrpc.yaml \
+        --output nexus/mcp/nexus_mcp/durable_tools_gateway/generated
