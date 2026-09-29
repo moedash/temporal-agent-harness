@@ -172,7 +172,7 @@ include = ["temporal_agent_harness*"]
 
 [tool.uv.sources]
 # Pinned to the AI-198 streams prototype of the Python SDK: `temporalio.streams` is not released.
-temporalio = { git = "https://github.com/moedash/sdk-python", rev = "86a455cfd3c954cd14f003d74c77f806e2223ecb" }
+temporalio = { git = "https://github.com/moedash/sdk-python", rev = "02c8c0e85c6ae80f0f80af71af89e848cb43bf49" }
 temporal-nexus-mcp = { path = "nexus/mcp", editable = true }
 
 [tool.pytest.ini_options]
