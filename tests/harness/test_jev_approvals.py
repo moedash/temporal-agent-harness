@@ -787,8 +787,11 @@ async def test_end_to_end_an_unsure_verdict_leaves_the_call_to_a_human():
             async for item in turn_events(client, handle.id):
                 ev = item
                 events.append(ev)
+                # The human answers once the evaluator has escalated. Answering on the
+                # request would race the evaluator's activity, and a human who wins that
+                # race supersedes the evaluation instead of following it.
                 if (
-                    ev.event.type == AgentEventType.TOOL_APPROVAL_REQUESTED
+                    ev.event.type == AgentEventType.AUTO_APPROVAL_EVALUATION_ENDED
                     and ev.event.tool_id == "r1"
                 ):
                     await agent_client.approve_tool("r1", approved=False, reason="not today")
@@ -840,8 +843,10 @@ async def test_end_to_end_a_failing_jev_call_escalates_rather_than_approving():
             async for item in turn_events(client, handle.id):
                 ev = item
                 events.append(ev)
+                # The human answers once the evaluation has failed, for the same reason as
+                # in the escalate case above.
                 if (
-                    ev.event.type == AgentEventType.TOOL_APPROVAL_REQUESTED
+                    ev.event.type == AgentEventType.AUTO_APPROVAL_EVALUATION_ERROR
                     and ev.event.tool_id == "r1"
                 ):
                     await agent_client.approve_tool("r1", approved=True, reason="ok by me")
