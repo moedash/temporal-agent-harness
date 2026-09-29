@@ -440,6 +440,20 @@ def _current_tool_injections() -> Mapping[str, Any]:
     return _CURRENT_TOOL_INJECTIONS.get() or {}
 
 
+def _reset_ambient(var: contextvars.ContextVar[Any], token: contextvars.Token[Any]) -> None:
+    """Restore ``var`` from ``token``, unless this frame is being finalized from outside its task.
+
+    A parked participant of a run the worker dropped without evicting is closed by the garbage
+    collector, in whatever context happens to be current. That context did not set ``var``, so
+    there is nothing of ours to restore in it, and the ``ValueError`` the reset raises there
+    would turn the teardown into an ordinary exception one frame up.
+    """
+    try:
+        var.reset(token)
+    except ValueError:
+        pass
+
+
 def _current_tool_id() -> str:
     """Return the tool id of the in-flight tool call, or raise if there is none.
 
@@ -1778,6 +1792,10 @@ class AgentWorkflowRunner:
         # generates its own. workflow.uuid4 is deterministic in-workflow (offline unit tests patch
         # it). Distinct from the full workflow_id, which the model/UI never needs to reproduce.
         self._agent_id: str = config.agent_id or workflow.uuid4().hex[:AGENT_ID_LENGTH]
+        # The run this runner publishes for, so a participant of this run that is finalized
+        # inside another run's activation can tell (``_in_own_run``). Offline construction
+        # (unit tests) has no run.
+        self._run_id: str | None = workflow.info().run_id if workflow.in_workflow() else None
         self._events = workflow.stream_writer(TURN_EVENTS)
         _assert_async_auto_mode_evaluator(auto_mode_evaluator)
         _assert_auto_mode_has_an_evaluator(approval_policy, auto_mode_evaluator)
@@ -2821,6 +2839,12 @@ class AgentWorkflowRunner:
         try:
             result = await self._dispatch_turn(agent, admitted, joined=joined)
         except Exception as e:  # noqa: BLE001 — surface ANY failure, keep the agent alive
+            if not self._in_own_run():
+                # Raised while this coroutine is being finalized from another workflow's
+                # activation (see ``_reset_ambient``): publishing would land the error on THAT
+                # workflow's stream. This turn is being abandoned, the same as below.
+                self._status.leave_turn()
+                raise
             self._pub(turn_id, turn_number, MessageHandlerError(message=str(e)))
         except BaseException:
             # Cancellation or workflow teardown — e.g. the instance is evicted (or the worker
@@ -3233,11 +3257,20 @@ class AgentWorkflowRunner:
         try:
             return await tool_callable(*args, **kwargs)
         finally:
-            _CURRENT_TOOL_INJECTIONS.reset(injections_token)
-            _CURRENT_TOOL_ID.reset(tool_id_token)
-            _CURRENT_RUNNER.reset(runner_token)
+            _reset_ambient(_CURRENT_TOOL_INJECTIONS, injections_token)
+            _reset_ambient(_CURRENT_TOOL_ID, tool_id_token)
+            _reset_ambient(_CURRENT_RUNNER, runner_token)
 
     # -- Internal -----------------------------------------------------------
+
+    def _in_own_run(self) -> bool:
+        """Whether the workflow event loop running this code is this runner's own run.
+
+        False outside a workflow, and false when a coroutine of this run is being finalized
+        by the garbage collector inside another run's activation, where the ambient runtime
+        (``workflow.time()``, the stream writer) is that other run's.
+        """
+        return workflow.in_workflow() and workflow.info().run_id == self._run_id
 
     def _pub(
         self,
