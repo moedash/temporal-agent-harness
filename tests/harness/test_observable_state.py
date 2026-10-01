@@ -508,10 +508,14 @@ def _live_draft_classes() -> int:
     """
 
     def live() -> int:
+        # `type(obj)` rather than `isinstance(obj, type)`: isinstance falls back to
+        # `obj.__class__`, and a sandbox restriction proxy raises on that attribute.
+        # Providers whose client library the sandbox proxies leave such objects alive.
         return sum(
             1
             for obj in gc.get_objects()
-            if isinstance(obj, type) and obj.__dict__.get("__harness_is_draft__", False)
+            if issubclass(type(obj), type)
+            and obj.__dict__.get("__harness_is_draft__", False)
         )
 
     previous = live()
